@@ -1,0 +1,32 @@
+// ============================================================
+// 深色主题 SCSS 变量（全局唯一色板来源）
+// ============================================================
+
+// 背景与面板
+$bg: #1a1d23; // 页面背景
+$bg-panel: #242830; // 卡片/面板背景
+$bg-hover: #2c313c; // 悬浮高亮
+$bg-input: #1f232b; // 输入框/代码块背景
+
+// 边框与文字
+$border: #343a46;
+$text: #e3e7ef;
+$text-dim: #8b93a7;
+
+// 主色（青/蓝）
+$primary: #27c2dc;
+$primary-blue: #3b82f6;
+
+// 语义色
+$success: #34d399; // 绿（approved）
+$warning: #fbbf24; // 黄（pending / 系统提示）
+$danger: #f87171; // 红（stderr / rejected / revoked）
+$stderr: #ff6b6b;
+
+// 圆角与阴影
+$radius: 10px;
+$radius-sm: 6px;
+$shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+
+// 布局
+$sidebar-width: 220px;

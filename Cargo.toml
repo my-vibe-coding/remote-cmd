@@ -1,0 +1,30 @@
+[package]
+name = "remote-cmd"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+macro-log = "0.3.0"
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8", features = ["macros"] }
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+argon2 = "0.5"
+rand = "0.8"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+base64 = "0.22"
+tempfile = "3"
+open = "5"
+dirs = "5"
+futures = "0.3"
+tokio-stream = "0.1"
+thiserror = "2"
+anyhow = "1"
+tower-http = { version = "0.6", features = ["trace"] }

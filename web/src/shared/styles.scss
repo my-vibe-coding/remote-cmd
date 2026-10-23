@@ -1,0 +1,204 @@
+// 全局样式：引用共享变量，并落地为 CSS 自定义属性供组件内使用
+@use './variables' as *;
+
+:root {
+  --bg: #{$bg};
+  --bg-panel: #{$bg-panel};
+  --bg-hover: #{$bg-hover};
+  --bg-input: #{$bg-input};
+  --border: #{$border};
+  --text: #{$text};
+  --text-dim: #{$text-dim};
+  --primary: #{$primary};
+  --primary-blue: #{$primary-blue};
+  --success: #{$success};
+  --warning: #{$warning};
+  --danger: #{$danger};
+  --stderr: #{$stderr};
+  --radius: #{$radius};
+  --radius-sm: #{$radius-sm};
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: $bg;
+  color: $text;
+  font-family: 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', system-ui, sans-serif;
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+// ---------- 通用卡片 ----------
+.card {
+  background: $bg-panel;
+  border: 1px solid $border;
+  border-radius: $radius;
+  padding: 20px;
+}
+
+.card-title {
+  margin: 0 0 16px;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+// ---------- 表单 ----------
+.input,
+.select {
+  background: $bg-input;
+  border: 1px solid $border;
+  color: $text;
+  border-radius: $radius-sm;
+  padding: 8px 12px;
+  font-size: 14px;
+  outline: none;
+  transition: border-color 0.15s;
+
+  &:focus {
+    border-color: $primary;
+  }
+
+  &::placeholder {
+    color: #5b6272;
+  }
+}
+
+// ---------- 按钮 ----------
+.btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid $border;
+  background: $bg-hover;
+  color: $text;
+  border-radius: $radius-sm;
+  padding: 8px 16px;
+  font-size: 14px;
+  cursor: pointer;
+  transition: filter 0.15s, opacity 0.15s;
+  user-select: none;
+
+  &:hover {
+    filter: brightness(1.15);
+  }
+
+  &:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  &.btn-primary {
+    background: $primary;
+    border-color: $primary;
+    color: #10222a;
+    font-weight: 600;
+  }
+
+  &.btn-danger {
+    background: transparent;
+    border-color: $danger;
+    color: $danger;
+  }
+
+  &.btn-success {
+    background: transparent;
+    border-color: $success;
+    color: $success;
+  }
+
+  &.btn-sm {
+    padding: 4px 10px;
+    font-size: 12px;
+  }
+}
+
+// ---------- 表格 ----------
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+
+  th,
+  td {
+    text-align: left;
+    padding: 10px 12px;
+    border-bottom: 1px solid $border;
+    vertical-align: middle;
+  }
+
+  th {
+    color: $text-dim;
+    font-weight: 500;
+    white-space: nowrap;
+  }
+
+  tbody tr:hover {
+    background: rgba(255, 255, 255, 0.02);
+  }
+}
+
+.mono {
+  font-family: Consolas, 'JetBrains Mono', monospace;
+}
+
+.dim {
+  color: $text-dim;
+}
+
+.empty-tip {
+  color: $text-dim;
+  text-align: center;
+  padding: 32px 0;
+}
+
+// ---------- 状态徽章 ----------
+.badge {
+  display: inline-block;
+  padding: 2px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  line-height: 18px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+
+  &.badge-pending {
+    color: $warning;
+    border-color: $warning;
+    background: rgba($warning, 0.12);
+  }
+
+  &.badge-approved {
+    color: $success;
+    border-color: $success;
+    background: rgba($success, 0.12);
+  }
+
+  &.badge-rejected,
+  &.badge-revoked {
+    color: $danger;
+    border-color: $danger;
+    background: rgba($danger, 0.12);
+  }
+
+  &.badge-default {
+    color: $text-dim;
+    border-color: $border;
+    background: transparent;
+  }
+}

@@ -1,0 +1,17 @@
+[
+  {
+    "id": "648f9650-6acc-48e8-aee7-1ec6f7a406e3",
+    "fingerprint": "08125351790622381703c5c60d95da390f8d48d7b9456907281bd39754956195",
+    "hostname": "PC-TEST",
+    "ip": "127.0.0.1",
+    "os": "windows",
+    "user": "tester",
+    "status": "revoked",
+    "whitelist": [
+      "ping"
+    ],
+    "created_at": "2026-10-23T11:42:06.149607400+00:00",
+    "approved_at": "2026-10-23T11:42:13.931293300+00:00",
+    "last_seen": "2026-10-23T11:42:13.958439400+00:00"
+  }
+]

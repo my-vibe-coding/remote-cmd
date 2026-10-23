@@ -1,0 +1,88 @@
+use sha2::{Digest, Sha256};
+
+use super::AppResult;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MachineInfo {
+    pub hostname: String,
+    pub ip: String,
+    pub os: String,
+    pub machine_guid: String,
+    pub user: String,
+}
+
+impl MachineInfo {
+    /// 采集本机信息：hostname（COMPUTERNAME）、本机 IP、OS、MachineGuid（Windows）
+    pub fn collect() -> Self {
+        let hostname = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown".into());
+        let user = std::env::var("USERNAME").unwrap_or_else(|_| "unknown".into());
+        let ip = local_ip().unwrap_or_else(|| "0.0.0.0".into());
+        MachineInfo {
+            hostname,
+            ip,
+            os: std::env::consts::OS.to_string(),
+            machine_guid: machine_guid(),
+            user,
+        }
+    }
+
+    /// 归一化指纹：SHA256(guid|hostname|ip|os)，防重复注册/伪造凭证领取
+    pub fn fingerprint(&self) -> String {
+        let raw = format!(
+            "{}|{}|{}|{}",
+            self.machine_guid.trim().to_lowercase(),
+            self.hostname.trim().to_lowercase(),
+            self.ip.trim(),
+            self.os.trim().to_lowercase()
+        );
+        hex_sha256(raw.as_bytes())
+    }
+}
+
+pub fn hex_sha256(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let out = hasher.finalize();
+    out.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Windows 注册表读取 MachineGuid；非 Windows 退化为 hostname
+fn machine_guid() -> String {
+    #[cfg(windows)]
+    {
+        if let Ok(out) = std::process::Command::new("reg")
+            .args(["query", r"HKLM\SOFTWARE\Microsoft\Cryptography", "/v", "MachineGuid"])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for line in text.lines() {
+                if let Some(idx) = line.find("MachineGuid") {
+                    if let Some(val) = line[idx + "MachineGuid".len()..].trim().split_whitespace().last() {
+                        return val.to_string();
+                    }
+                }
+            }
+        }
+        // reg query 失败时退化为 hostname，保证仍可用
+        std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown-guid".into())
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-guid".into())
+    }
+}
+
+/// 通过 UDP connect 技巧获取本机出口 IP（不真正发包）
+fn local_ip() -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    Some(socket.local_addr().ok()?.ip().to_string())
+}
+
+/// 简化校验：字段非空
+pub fn validate_info(info: &MachineInfo) -> AppResult<()> {
+    if info.hostname.trim().is_empty() || info.machine_guid.trim().is_empty() {
+        return Err(super::AppError::msg("hostname 与 machine_guid 不能为空"));
+    }
+    Ok(())
+}
