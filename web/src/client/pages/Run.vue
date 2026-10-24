@@ -39,6 +39,82 @@ const formError = ref('')
 const runs = reactive<RunItem[]>([])
 let nextId = 1
 
+// ---------- 输出行缓冲 ----------
+// SSE 的 Output 事件是管道任意分片（不保证按行分割），需按 \n 缓冲成完整行；
+// \r 处理为回车覆盖（进度条等场景）；stdout/stderr 各自独立缓冲。
+interface StreamBufState {
+  acc: string // 当前未换行的内容（行尾缓冲）
+  overwritten: boolean // acc 经历过 \r 重置
+  openIdx: number | null // acc 对应的 lines 下标
+}
+const streamBufs = new Map<number, Map<string, StreamBufState>>()
+
+function bufStateFor(runId: number, stream: string): StreamBufState {
+  let m = streamBufs.get(runId)
+  if (!m) {
+    m = new Map()
+    streamBufs.set(runId, m)
+  }
+  let st = m.get(stream)
+  if (!st) {
+    st = { acc: '', overwritten: false, openIdx: null }
+    m.set(stream, st)
+  }
+  return st
+}
+
+function dropRunBuffers(runId: number) {
+  streamBufs.delete(runId)
+}
+
+/** 将一块输出文本按行并入面板；\r 重置当前行（回车覆盖），\n 结束一行 */
+function feedOutput(item: RunItem, stream: 'stdout' | 'stderr', text: string) {
+  const st = bufStateFor(item.id, stream)
+  const flushed: { text: string; overwrote: boolean }[] = []
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+    if (ch === '\r') {
+      if (text[i + 1] === '\n') {
+        i++
+        flushed.push({ text: st.acc, overwrote: st.overwritten })
+        st.acc = ''
+        st.overwritten = false
+      } else {
+        st.acc = ''
+        st.overwritten = true
+      }
+    } else if (ch === '\n') {
+      flushed.push({ text: st.acc, overwrote: st.overwritten })
+      st.acc = ''
+      st.overwritten = false
+    } else {
+      st.acc += ch
+    }
+  }
+  // 落盘完整行：第一行若接在上一块的行尾，追加/覆盖到已打开的行
+  for (let j = 0; j < flushed.length; j++) {
+    const f = flushed[j]
+    if (st.openIdx != null && item.lines[st.openIdx]) {
+      const open = item.lines[st.openIdx]
+      if (f.overwrote) open.text = f.text
+      else open.text += f.text
+    } else {
+      item.lines.push({ kind: stream, text: f.text })
+      st.openIdx = item.lines.length - 1
+    }
+    if (j < flushed.length - 1) {
+      // 后续完整行总是新行
+      st.openIdx = null
+    }
+  }
+  // 行尾缓冲（最后一个 \n 之后的内容）总是另起新行
+  st.openIdx = null
+  if (st.acc) {
+    item.lines.push({ kind: stream, text: st.acc })
+    st.openIdx = item.lines.length - 1
+  }
+}
+
 const aliasNames = computed(() => Object.keys(aliases.value))
 
 /** 别名绑定服务器的显示名（未绑定返回空串 = 默认服务器） */
@@ -127,7 +203,7 @@ async function run() {
           item.truncated = true
           item.lines.push({ kind: 'sys', text: '⚠ 输出超过 1MB，已被截断' })
         } else {
-          item.lines.push({ kind: payload.stream, text: decodeBase64Utf8(payload.data_b64) })
+          feedOutput(item, payload.stream, decodeBase64Utf8(payload.data_b64))
         }
       } else if (ev.event === 'exit') {
         const payload = JSON.parse(ev.data) as ExecExitPayload
@@ -149,9 +225,11 @@ async function run() {
       item.running = false
       item.finished = true
     }
+    dropRunBuffers(item.id)
   } catch (e) {
     item.running = false
     item.finished = true
+    dropRunBuffers(item.id)
     const msg = e instanceof ApiError ? `请求失败 (HTTP ${e.status})：${e.message}` : String(e)
     item.lines.push({ kind: 'stderr', text: msg })
     scrollToBottom(item.id)
@@ -163,6 +241,7 @@ async function run() {
 function closeRun(id: number) {
   controllers.get(id)?.abort()
   controllers.delete(id)
+  dropRunBuffers(id)
   const i = runs.findIndex((r) => r.id === id)
   if (i >= 0) runs.splice(i, 1)
 }
