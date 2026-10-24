@@ -5,6 +5,8 @@ import { ApiError, localApi } from '../../shared/api'
 interface AliasItem {
   name: string
   template: string
+  /** 已存在的脚本路径；空 = 未生成 */
+  script: string
 }
 
 interface GenResult {
@@ -19,8 +21,13 @@ const error = ref('')
 
 async function load() {
   try {
-    const data = await localApi.getAliases()
-    aliases.value = Object.entries(data).map(([n, v]) => ({ name: n, template: v.template }))
+    // 带 ?script 查询，后端检测每个别名脚本是否存在
+    const data = await localApi.getAliases(true)
+    aliases.value = Object.entries(data).map(([n, v]) => ({
+      name: n,
+      template: v.template,
+      script: v.script || '',
+    }))
   } catch (e) {
     error.value = e instanceof ApiError ? `加载别名失败：${e.message}` : '加载别名失败：网络错误'
   }
@@ -31,10 +38,33 @@ async function generate(name: string) {
   error.value = ''
   try {
     results[name] = await localApi.script(name)
+    const item = aliases.value.find((a) => a.name === name)
+    if (item) item.script = results[name].path
   } catch (e) {
     error.value = e instanceof ApiError ? `生成失败 (HTTP ${e.status})：${e.message}` : '生成失败：网络错误'
   } finally {
     generating.value = null
+  }
+}
+
+async function reveal(name: string) {
+  error.value = ''
+  try {
+    await localApi.revealScript(name)
+  } catch (e) {
+    error.value = e instanceof ApiError ? `定位失败 (HTTP ${e.status})：${e.message}` : '定位失败：网络错误'
+  }
+}
+
+async function removeScript(item: AliasItem) {
+  if (!window.confirm(`确认删除脚本「${item.name}.bat」？`)) return
+  error.value = ''
+  try {
+    await localApi.deleteScript(item.name)
+    item.script = ''
+    delete results[item.name]
+  } catch (e) {
+    error.value = e instanceof ApiError ? `删除失败 (HTTP ${e.status})：${e.message}` : '删除失败：网络错误'
   }
 }
 
@@ -63,9 +93,17 @@ onMounted(load)
           <span class="mono alias-name">{{ a.name }}</span>
           <code class="template-code">{{ a.template }}</code>
         </div>
-        <button class="btn btn-primary btn-sm" :disabled="generating === a.name" @click="generate(a.name)">
-          {{ generating === a.name ? '生成中…' : '生成 .bat 脚本' }}
-        </button>
+        <div class="actions">
+          <button
+            class="btn btn-primary btn-sm"
+            :disabled="generating === a.name"
+            @click="generate(a.name)"
+          >
+            {{ generating === a.name ? '生成中…' : a.script ? '重新生成 .bat 脚本' : '生成 .bat 脚本' }}
+          </button>
+          <button v-if="a.script" class="btn btn-sm" @click="reveal(a.name)">在系统中显示</button>
+          <button v-if="a.script" class="btn btn-danger btn-sm" @click="removeScript(a)">删除脚本</button>
+        </div>
       </div>
 
       <template v-if="results[a.name]">
@@ -127,6 +165,13 @@ onMounted(load)
   align-items: center;
   justify-content: space-between;
   gap: 16px;
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
 }
 
 .head {

@@ -1,10 +1,11 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
-import { RouterLink, RouterView } from 'vue-router'
+import { computed, ref, watch } from 'vue'
+import { RouterLink, RouterView, useRoute } from 'vue-router'
 import { useIntervalFn } from '@vueuse/core'
 import { localApi, type ModeInfo } from '../shared/api'
 
-// 侧栏顶部展示注册概要（轮询刷新以保证注册成功后状态同步；失败时静默）
+// 侧栏顶部展示注册概要（失败时静默）
+const route = useRoute()
 const mode = ref<ModeInfo | null>(null)
 const refreshMode = () =>
   localApi
@@ -12,7 +13,20 @@ const refreshMode = () =>
     .then((m) => (mode.value = m))
     .catch(() => {})
 refreshMode()
-useIntervalFn(refreshMode, 3000)
+// 仅在「注册状态」页轮询以同步注册结果；其它页面停止轮询，切换进来时刷新一次
+const { pause, resume } = useIntervalFn(refreshMode, 3000, { immediate: false })
+watch(
+  () => route.name,
+  (name) => {
+    if (name === 'status') {
+      resume()
+    } else {
+      pause()
+      refreshMode()
+    }
+  },
+  { immediate: true },
+)
 
 const navItems = [
   { to: '/', label: '注册状态' },

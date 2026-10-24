@@ -52,6 +52,8 @@ export interface AliasDefInfo {
   template: string
   /** 绑定的执行服务器；空 = 默认服务器 */
   server?: string | null
+  /** 已存在的脚本路径（查询 ?script 时后端检测到脚本存在才返回） */
+  script?: string | null
 }
 
 /** 注册/凭证记录（registrations 与 credentials 接口结构相同） */
@@ -146,9 +148,12 @@ export const localApi = {
   /** 已注册服务器列表（轻量，不查询远端） */
   getServers: () => localRequest<{ servers: ServerRegInfo[] }>('GET', '/api/local/servers'),
 
-  /** 别名列表 */
-  getAliases: () =>
-    localRequest<Record<string, AliasDefInfo>>('GET', '/api/local/aliases'),
+  /** 别名列表（withScript 为 true 时附带每个别名脚本的存在状态与路径） */
+  getAliases: (withScript = false) =>
+    localRequest<Record<string, AliasDefInfo>>(
+      'GET',
+      withScript ? '/api/local/aliases?script' : '/api/local/aliases',
+    ),
 
   /** 创建/更新别名（template 支持 {args} 占位；server 为绑定的执行服务器，空 = 默认） */
   putAlias: (name: string, template: string, server?: string | null) =>
@@ -185,6 +190,17 @@ export const localApi = {
   /** 为别名生成脚本文件 */
   script: (alias: string) =>
     localRequest<{ path: string; bin_dir: string }>('POST', '/api/local/script', { alias }),
+
+  /** 删除别名对应的 .bat 脚本 */
+  deleteScript: (name: string) =>
+    localRequest<{ ok: boolean }>(
+      'DELETE',
+      `/api/local/aliases/${encodeURIComponent(name)}/script`,
+    ),
+
+  /** 在系统文件管理器中定位别名脚本 */
+  revealScript: (alias: string) =>
+    localRequest<{ ok: boolean }>('POST', '/api/local/script/reveal', { alias }),
 }
 
 // ---------- 管理端 API（HTTPS，Bearer 认证，经 /api/admin 代理） ----------

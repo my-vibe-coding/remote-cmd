@@ -4,7 +4,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::extract::{Path, Request};
+use axum::extract::{Path, Query, Request};
 use axum::http::{header, StatusCode, Uri};
 use axum::response::Response;
 use axum::routing::{delete, get, post};
@@ -26,6 +26,8 @@ pub fn router() -> Router {
         .route("/api/local/servers", get(list_servers))
         .route("/api/local/aliases", get(list_aliases).put(upsert_alias))
         .route("/api/local/aliases/{name}", delete(remove_alias))
+        .route("/api/local/aliases/{name}/script", delete(delete_alias_script))
+        .route("/api/local/script/reveal", post(reveal_script))
         .route("/api/local/exec", post(exec))
         .route("/api/local/script", post(gen_script))
         .fallback(local_static)
@@ -273,9 +275,31 @@ async fn status() -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     })))
 }
 
-async fn list_aliases() -> Json<serde_json::Value> {
+#[derive(Deserialize)]
+struct AliasQuery {
+    /// 存在时检查每个别名对应脚本是否已存在，存在则附加 script 字段（脚本路径）
+    script: Option<String>,
+}
+
+async fn list_aliases(Query(q): Query<AliasQuery>) -> Json<serde_json::Value> {
     let aliases = crate::client::config::load_aliases().unwrap_or_default();
-    Json(serde_json::to_value(&aliases).unwrap_or_default())
+    let mut value = serde_json::to_value(&aliases).unwrap_or_default();
+    if q.script.is_some()
+        && let Some(map) = value.as_object_mut()
+    {
+        for (name, v) in map.iter_mut() {
+            let path = crate::client::script::script_path(name);
+            if path.is_file()
+                && let Some(obj) = v.as_object_mut()
+            {
+                obj.insert(
+                    "script".into(),
+                    serde_json::Value::String(path.display().to_string()),
+                );
+            }
+        }
+    }
+    Json(value)
 }
 
 #[derive(Deserialize)]
@@ -380,4 +404,35 @@ async fn gen_script(Json(body): Json<ScriptBody>) -> Result<Json<serde_json::Val
         "path": path.display().to_string(),
         "bin_dir": bin_dir.display().to_string(),
     })))
+}
+
+/// 删除别名对应的 .bat 脚本（脚本不存在时同样返回成功）
+async fn delete_alias_script(
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let path = crate::client::script::script_path(&name);
+    if path.is_file() {
+        std::fs::remove_file(&path)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("删除脚本失败: {e}")))?;
+    }
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct RevealBody {
+    alias: String,
+}
+
+/// 在系统文件管理器中定位别名脚本
+async fn reveal_script(
+    Json(body): Json<RevealBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let path = crate::client::script::script_path(&body.alias);
+    if !path.is_file() {
+        return Err((StatusCode::NOT_FOUND, "脚本不存在，请先生成".into()));
+    }
+    crate::client::script::reveal_in_explorer(&path).map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, format!("打开文件管理器失败: {e}"))
+    })?;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }

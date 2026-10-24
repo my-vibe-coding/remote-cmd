@@ -44,6 +44,50 @@ pub fn gen_scripts(alias: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// 别名对应的脚本路径（无论是否存在）
+pub fn script_path(alias: &str) -> std::path::PathBuf {
+    crate::common::paths::client_data_dir().join("bin").join(format!("{alias}.bat"))
+}
+
+/// 在系统文件管理器中定位文件（Windows: 资源管理器并选中；macOS: Finder；其它 Unix: 打开父目录）
+#[cfg(windows)]
+pub fn reveal_in_explorer(path: &std::path::Path) -> Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    unsafe {
+        use windows_sys::Win32::Foundation::S_OK;
+        use windows_sys::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, COINIT_APARTMENTTHREADED};
+        use windows_sys::Win32::UI::Shell::{ILCreateFromPathW, SHOpenFolderAndSelectItems};
+
+        // 已初始化时返回 S_FALSE，同样视为可用
+        let _ = CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED as u32);
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let pidl = ILCreateFromPathW(wide.as_ptr());
+        if pidl.is_null() {
+            return Err(anyhow!("解析路径失败"));
+        }
+        let hr = SHOpenFolderAndSelectItems(pidl, 0, std::ptr::null(), 0);
+        CoTaskMemFree(pidl.cast());
+        if hr != S_OK {
+            return Err(anyhow!("SHOpenFolderAndSelectItems 失败: 0x{hr:08X}"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub fn reveal_in_explorer(path: &std::path::Path) -> Result<()> {
+    std::process::Command::new("open").arg("-R").arg(path).spawn()?;
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+pub fn reveal_in_explorer(path: &std::path::Path) -> Result<()> {
+    let dir = path.parent().unwrap_or(path);
+    std::process::Command::new("xdg-open").arg(dir).spawn()?;
+    Ok(())
+}
+
 /// 别名 CRUD 校验：名称仅允许字母数字下划线连字符
 pub fn validate_alias_name(name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 64 {
