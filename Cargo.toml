@@ -7,7 +7,7 @@ edition = "2024"
 macro-log = "0.3.0"
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.8", features = ["macros"] }
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+axum-server = { version = "0.7", features = ["tls-rustls-no-provider"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rcgen = "0.13"
 clap = { version = "4", features = ["derive"] }
