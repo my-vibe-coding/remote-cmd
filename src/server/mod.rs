@@ -66,8 +66,9 @@ pub async fn serve(port: u16, password: Option<String>, data_dir: Option<String>
     let app = routes::router(state);
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
-    macro_log::i!("remote-cmd 服务端已启动: https://{addr}");
-    macro_log::i!("管理页面: https://127.0.0.1:{port}/admin");
+    let host = crate::common::net::fetch_public_ipv4().await.unwrap_or("127.0.0.1".to_string());
+    macro_log::i!("remote-cmd 服务端已启动: https://{host}:{port}");
+    macro_log::i!("管理页面: https://{host}:{port}/admin");
     if let Some(pwd) = printed_password {
         macro_log::i!("（首次启动，请记录上方自动生成的管理员密码）");
         let _ = pwd;

@@ -1,6 +1,7 @@
 pub mod crypto;
 pub mod fingerprint;
 pub mod json_file;
+pub mod net;
 pub mod paths;
 
 use std::io;
