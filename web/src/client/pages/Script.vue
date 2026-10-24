@@ -57,7 +57,7 @@ async function reveal(name: string) {
 }
 
 async function removeScript(item: AliasItem) {
-  if (!window.confirm(`确认删除脚本「${item.name}.exe」？`)) return
+  if (!window.confirm(`确认删除别名「${item.name}」的脚本？`)) return
   error.value = ''
   try {
     await localApi.deleteScript(item.name)
@@ -84,7 +84,7 @@ onMounted(load)
     <h1 class="page-title">脚本生成</h1>
 
     <p class="dim intro">
-      为别名一键生成 <code>.exe</code> 脚本：生成后无需打开本页面，在任意终端输入别名即可执行命令。
+      为别名一键生成可执行脚本（Windows 为 <code>.exe</code>，其它平台无后缀）。生成后无需打开本页面，在任意终端输入别名即可执行命令。
     </p>
 
     <section v-for="a in aliases" :key="a.name" class="card">
@@ -99,7 +99,7 @@ onMounted(load)
             :disabled="generating === a.name"
             @click="generate(a.name)"
           >
-            {{ generating === a.name ? '生成中…' : a.script ? '重新生成 .exe 脚本' : '生成 .exe 脚本' }}
+            {{ generating === a.name ? '生成中…' : a.script ? '重新生成脚本' : '生成脚本' }}
           </button>
           <button v-if="a.script" class="btn btn-sm" @click="reveal(a.name)">在系统中显示</button>
           <button v-if="a.script" class="btn btn-danger btn-sm" @click="removeScript(a)">删除脚本</button>

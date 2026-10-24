@@ -2,9 +2,15 @@ use anyhow::{anyhow, Result};
 
 use super::config::load_aliases;
 
-/// 生成别名脚本到 %USERPROFILE%\.remote-cmd\bin\<别名>.exe
+/// 别名脚本文件名后缀：Windows 依赖 PATHEXT 需要 .exe，Unix 无后缀
+#[cfg(windows)]
+const SCRIPT_SUFFIX: &str = ".exe";
+#[cfg(not(windows))]
+const SCRIPT_SUFFIX: &str = "";
+
+/// 生成别名脚本到 <数据目录>\bin\<别名><SCRIPT_SUFFIX>
 /// 内容为主 exe 的副本；exe 启动时根据「所在目录为 bin 且文件名对应已存在别名」自动进入别名执行模式。
-/// 相比 .bat 脚本：Ctrl+C 直接终止、无「终止批处理操作吗(Y/N)?」提示，且保留退出码。
+/// 相比 Windows 旧版 .bat 脚本：Ctrl+C 直接终止、无「终止批处理操作吗(Y/N)?」提示，且保留退出码。
 pub fn gen_script(alias: &str) -> Result<std::path::PathBuf> {
     let aliases = load_aliases()?;
     if !aliases.contains_key(alias) {
@@ -13,15 +19,19 @@ pub fn gen_script(alias: &str) -> Result<std::path::PathBuf> {
     let exe = std::env::current_exe()?;
     let dir = crate::common::paths::client_data_dir().join("bin");
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{alias}.exe"));
+    let path = dir.join(format!("{alias}{SCRIPT_SUFFIX}"));
     if path.exists() {
         std::fs::remove_file(&path)?;
     }
+    // Unix 上 fs::copy 保留可执行权限位，复制出来即可直接运行
     std::fs::copy(&exe, &path)?;
-    // 清理旧版 .bat 脚本（PATHEXT 中 .exe 优先级高于 .bat，这里直接删除避免混淆）
-    let old = dir.join(format!("{alias}.bat"));
-    if old.exists() {
-        let _ = std::fs::remove_file(&old);
+    // 清理 Windows 旧版 .bat 脚本（PATHEXT 中 .exe 优先级高于 .bat，这里直接删除避免混淆）
+    #[cfg(windows)]
+    {
+        let old = dir.join(format!("{alias}.bat"));
+        if old.exists() {
+            let _ = std::fs::remove_file(&old);
+        }
     }
     Ok(path)
 }
@@ -53,10 +63,10 @@ pub fn gen_scripts(alias: Option<&str>) -> Result<()> {
 
 /// 别名对应的脚本路径（无论是否存在）
 pub fn script_path(alias: &str) -> std::path::PathBuf {
-    crate::common::paths::client_data_dir().join("bin").join(format!("{alias}.exe"))
+    crate::common::paths::client_data_dir().join("bin").join(format!("{alias}{SCRIPT_SUFFIX}"))
 }
 
-/// 当前进程是否为脚本生成创建的别名 exe（位于 bin 目录且文件名对应已存在的别名）
+/// 当前进程是否为脚本生成创建的别名副本（位于 bin 目录且文件名对应已存在的别名）
 /// 用于在 main 中于 clap 解析之前拦截，直接进入别名执行模式
 pub fn shim_alias() -> Option<String> {
     let exe = std::env::current_exe().ok()?;

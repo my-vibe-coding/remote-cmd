@@ -29,7 +29,7 @@ pub enum Command {
         /// 传给远程命令的参数
         args: Vec<String>,
     },
-    /// 为指定别名生成 bat 脚本到 %USERPROFILE%\.remote-cmd\bin
+    /// 为指定别名生成 exe 脚本到 %USERPROFILE%\.remote-cmd\bin
     GenScript {
         /// 命令别名（省略则为所有别名生成）
         alias: Option<String>,
