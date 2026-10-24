@@ -2,8 +2,9 @@ use anyhow::{anyhow, Result};
 
 use super::config::load_aliases;
 
-/// 生成 bat 脚本到 %USERPROFILE%\.remote-cmd\bin\<别名>.bat
-/// 内容: @"<本 exe>" run <别名> %*
+/// 生成别名脚本到 %USERPROFILE%\.remote-cmd\bin\<别名>.exe
+/// 内容为主 exe 的副本；exe 启动时根据「所在目录为 bin 且文件名对应已存在别名」自动进入别名执行模式。
+/// 相比 .bat 脚本：Ctrl+C 直接终止、无「终止批处理操作吗(Y/N)?」提示，且保留退出码。
 pub fn gen_script(alias: &str) -> Result<std::path::PathBuf> {
     let aliases = load_aliases()?;
     if !aliases.contains_key(alias) {
@@ -12,10 +13,16 @@ pub fn gen_script(alias: &str) -> Result<std::path::PathBuf> {
     let exe = std::env::current_exe()?;
     let dir = crate::common::paths::client_data_dir().join("bin");
     std::fs::create_dir_all(&dir)?;
-    let path = dir.join(format!("{alias}.bat"));
-    // `--` 之后的参数（含别名与 %* 透传参数）不再被 clap 解析为选项
-    let content = format!("@\"{}\" run -- \"{}\" %*\r\n", exe.display(), alias);
-    std::fs::write(&path, content)?;
+    let path = dir.join(format!("{alias}.exe"));
+    if path.exists() {
+        std::fs::remove_file(&path)?;
+    }
+    std::fs::copy(&exe, &path)?;
+    // 清理旧版 .bat 脚本（PATHEXT 中 .exe 优先级高于 .bat，这里直接删除避免混淆）
+    let old = dir.join(format!("{alias}.bat"));
+    if old.exists() {
+        let _ = std::fs::remove_file(&old);
+    }
     Ok(path)
 }
 
@@ -46,7 +53,22 @@ pub fn gen_scripts(alias: Option<&str>) -> Result<()> {
 
 /// 别名对应的脚本路径（无论是否存在）
 pub fn script_path(alias: &str) -> std::path::PathBuf {
-    crate::common::paths::client_data_dir().join("bin").join(format!("{alias}.bat"))
+    crate::common::paths::client_data_dir().join("bin").join(format!("{alias}.exe"))
+}
+
+/// 当前进程是否为脚本生成创建的别名 exe（位于 bin 目录且文件名对应已存在的别名）
+/// 用于在 main 中于 clap 解析之前拦截，直接进入别名执行模式
+pub fn shim_alias() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let bin = crate::common::paths::client_data_dir().join("bin");
+    let exe_dir = std::fs::canonicalize(&exe).ok()?.parent()?.to_path_buf();
+    let bin_dir = std::fs::canonicalize(&bin).ok()?;
+    if exe_dir != bin_dir {
+        return None;
+    }
+    let alias = exe.file_stem()?.to_str()?;
+    let aliases = load_aliases().ok()?;
+    aliases.contains_key(alias).then(|| alias.to_string())
 }
 
 /// 在系统文件管理器中定位文件（Windows: 资源管理器并选中；macOS: Finder；其它 Unix: 打开父目录）
