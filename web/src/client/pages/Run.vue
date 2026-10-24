@@ -41,13 +41,23 @@ let nextId = 1
 
 // ---------- 输出行缓冲 ----------
 // SSE 的 Output 事件是管道任意分片（不保证按行分割），需按 \n 缓冲成完整行；
-// \r 处理为回车覆盖（进度条等场景）；stdout/stderr 各自独立缓冲。
+// \r 按终端覆盖语义处理（进度条回写）：\r 后的内容从行首覆盖，最终行 = overlay(基准, 新内容)；
+// stdout/stderr 各自独立缓冲。
 interface StreamBufState {
-  acc: string // 当前未换行的内容（行尾缓冲）
-  overwritten: boolean // acc 经历过 \r 重置
-  openIdx: number | null // acc 对应的 lines 下标
+  acc: string // 当前未落行的新写入内容（\r 后的光标区）
+  crBase: string | null // 最近一次 \r 时的行内容基准；null = 无待处理 \r
+  openIdx: number | null // 正在构建的行在 lines 中的下标
 }
 const streamBufs = new Map<number, Map<string, StreamBufState>>()
+
+/** 终端覆盖语义：over 从行首覆盖 base，超出部分保留 base 尾部 */
+function overlay(base: string, over: string): string {
+  return over.length >= base.length ? over : over + base.slice(over.length)
+}
+
+function displayOf(st: StreamBufState): string {
+  return st.crBase != null ? overlay(st.crBase, st.acc) : st.acc
+}
 
 function bufStateFor(runId: number, stream: string): StreamBufState {
   let m = streamBufs.get(runId)
@@ -57,7 +67,7 @@ function bufStateFor(runId: number, stream: string): StreamBufState {
   }
   let st = m.get(stream)
   if (!st) {
-    st = { acc: '', overwritten: false, openIdx: null }
+    st = { acc: '', crBase: null, openIdx: null }
     m.set(stream, st)
   }
   return st
@@ -67,50 +77,41 @@ function dropRunBuffers(runId: number) {
   streamBufs.delete(runId)
 }
 
-/** 将一块输出文本按行并入面板；\r 重置当前行（回车覆盖），\n 结束一行 */
+/** 将一块输出文本按行并入面板（跨块续行 + \r 覆盖语义） */
 function feedOutput(item: RunItem, stream: 'stdout' | 'stderr', text: string) {
   const st = bufStateFor(item.id, stream)
-  const flushed: { text: string; overwrote: boolean }[] = []
+  const flush = () => {
+    const line = displayOf(st)
+    if (st.openIdx != null && item.lines[st.openIdx]) item.lines[st.openIdx].text = line
+    else item.lines.push({ kind: stream, text: line })
+    st.acc = ''
+    st.crBase = null
+    st.openIdx = null
+  }
   for (let i = 0; i < text.length; i++) {
     const ch = text[i]
     if (ch === '\r') {
       if (text[i + 1] === '\n') {
+        // CRLF：正常换行，内容保持不变
         i++
-        flushed.push({ text: st.acc, overwrote: st.overwritten })
-        st.acc = ''
-        st.overwritten = false
+        flush()
       } else {
+        // 单独 \r：光标回到行首，后续内容从行首覆盖
+        st.crBase = st.crBase != null ? overlay(st.crBase, st.acc) : st.acc
         st.acc = ''
-        st.overwritten = true
       }
     } else if (ch === '\n') {
-      flushed.push({ text: st.acc, overwrote: st.overwritten })
-      st.acc = ''
-      st.overwritten = false
+      flush()
     } else {
       st.acc += ch
     }
   }
-  // 落盘完整行：第一行若接在上一块的行尾，追加/覆盖到已打开的行
-  for (let j = 0; j < flushed.length; j++) {
-    const f = flushed[j]
-    if (st.openIdx != null && item.lines[st.openIdx]) {
-      const open = item.lines[st.openIdx]
-      if (f.overwrote) open.text = f.text
-      else open.text += f.text
-    } else {
-      item.lines.push({ kind: stream, text: f.text })
-      st.openIdx = item.lines.length - 1
-    }
-    if (j < flushed.length - 1) {
-      // 后续完整行总是新行
-      st.openIdx = null
-    }
-  }
-  // 行尾缓冲（最后一个 \n 之后的内容）总是另起新行
-  st.openIdx = null
-  if (st.acc) {
-    item.lines.push({ kind: stream, text: st.acc })
+  // 行尾缓冲落到正在构建的行（无则新建；空内容不占行）
+  const disp = displayOf(st)
+  if (st.openIdx != null && item.lines[st.openIdx]) {
+    item.lines[st.openIdx].text = disp
+  } else if (disp !== '') {
+    item.lines.push({ kind: stream, text: disp })
     st.openIdx = item.lines.length - 1
   }
 }
