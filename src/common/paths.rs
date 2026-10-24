@@ -14,6 +14,12 @@ pub fn client_data_dir() -> PathBuf {
 }
 
 fn base_dir() -> PathBuf {
+    // REMOTE_CMD_HOME 可覆盖数据根目录（用于多实例/测试隔离）
+    if let Ok(dir) = std::env::var("REMOTE_CMD_HOME") {
+        if !dir.trim().is_empty() {
+            return PathBuf::from(dir);
+        }
+    }
     if let Some(home) = dirs::home_dir() {
         return home.join(".remote-cmd");
     }

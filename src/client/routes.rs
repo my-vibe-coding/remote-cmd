@@ -92,10 +92,8 @@ async fn register_to_server(
 
     if let Some(existing) = config.servers.iter_mut().find(|s| s.server_url == server_url) {
         existing.client_id = client_id;
-        if let Some(t) = &token {
-            existing.token = Some(t.clone());
-        }
-        existing.registered = existing.registered || registered;
+        existing.token = token;
+        existing.registered = registered;
     } else {
         config.servers.push(ServerReg {
             server_url: server_url.clone(),
@@ -247,10 +245,7 @@ async fn status() -> Result<Json<serde_json::Value>, (StatusCode, String)> {
                 }
                 Err((code, _)) => {
                     if code == 404 {
-                        // 服务端已删除该记录：客户端感知并移除本地注册
-                        config.servers.retain(|s| s.server_url != reg.server_url);
-                        changed = true;
-                        invalidate_status_cache(&reg.server_url);
+                        // 服务端已删除该记录：保留本地数据并标记，允许重新注册
                         status = "deleted".into();
                     } else {
                         status = "unreachable".into();

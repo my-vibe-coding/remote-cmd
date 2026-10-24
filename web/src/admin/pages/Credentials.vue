@@ -96,6 +96,21 @@ async function revoke(row: Registration) {
   }
 }
 
+/** 恢复已吊销的凭证：重新签发 token（等同重新批准） */
+async function restore(row: Registration) {
+  if (!window.confirm(`确认恢复「${row.hostname}（${row.ip}）」的凭证？将重新签发 token。`)) return
+  busyId.value = keyOf(row)
+  error.value = ''
+  try {
+    await adminApi.approve(row.id)
+    await load()
+  } catch (e) {
+    error.value = e instanceof ApiError ? `恢复失败：${e.message}` : '恢复失败：网络错误'
+  } finally {
+    busyId.value = null
+  }
+}
+
 function resetDraft(row: Registration) {
   drafts[keyOf(row)] = [...(row.whitelist ?? [])]
 }
@@ -135,6 +150,14 @@ onMounted(load)
             @click="revoke(row)"
           >
             吊销
+          </button>
+          <button
+            v-if="row.status === 'revoked'"
+            class="btn btn-sm"
+            :disabled="busyId === keyOf(row)"
+            @click="restore(row)"
+          >
+            恢复
           </button>
         </div>
       </div>

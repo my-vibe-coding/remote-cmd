@@ -37,6 +37,29 @@ pub async fn register(
     let fp = info.fingerprint();
     if let Some(existing) = state.store.find_by_fingerprint(&fp) {
         let status = existing.status;
+        // 已吊销/已拒绝的记录：重新注册时重置为待审批，需管理员重新批准
+        if matches!(status, ClientStatus::Revoked | ClientStatus::Rejected) {
+            let record = state
+                .store
+                .update(&existing.id, |c| {
+                    c.status = ClientStatus::Pending;
+                    c.token = None;
+                    c.last_seen = Some(Utc::now().to_rfc3339());
+                })
+                .map_err(internal)?;
+            let record = record.unwrap_or(existing);
+            state.audit.log(
+                "register.reapply",
+                &record.hostname,
+                Some(serde_json::json!({ "client_id": record.id, "prev_status": status })),
+            );
+            return Ok(Json(RegisterResponse {
+                client_id: record.id,
+                status: ClientStatus::Pending,
+                token: None,
+                hostname: Some(record.hostname),
+            }));
+        }
         state
             .store
             .update(&existing.id, |c| c.last_seen = Some(Utc::now().to_rfc3339()))

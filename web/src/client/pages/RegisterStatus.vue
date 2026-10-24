@@ -89,6 +89,24 @@ async function submit() {
   }
 }
 
+// ---------- 重新注册（吊销/拒绝/删除后，凭保留的服务器数据重新申请） ----------
+async function reRegister(s: ServerRegInfo) {
+  unregistering.value = s.server_url
+  errorMsg.value = ''
+  notice.value = ''
+  try {
+    const r = await localApi.register(s.server_url)
+    regToken.value = r.token ?? ''
+    notice.value = `已向「${s.hostname || s.server_url}」重新提交注册申请`
+    await pollStatus()
+  } catch (e) {
+    errorMsg.value =
+      e instanceof ApiError ? `重新注册失败 (HTTP ${e.status})：${e.message}` : '重新注册失败：网络错误'
+  } finally {
+    unregistering.value = ''
+  }
+}
+
 // ---------- 注销 ----------
 async function unregister(s: ServerRegInfo) {
   const name = s.hostname || s.server_url
@@ -154,6 +172,14 @@ onMounted(async () => {
             <StatusBadge :status="displayStatus(s)" />
             <span class="mono server-url">{{ s.server_url }}</span>
             <button
+              v-if="!s.registered && s.status !== 'pending' && s.status !== 'unreachable'"
+              class="btn btn-sm"
+              :disabled="unregistering === s.server_url"
+              @click="reRegister(s)"
+            >
+              {{ unregistering === s.server_url ? '提交中…' : '重新注册' }}
+            </button>
+            <button
               class="btn btn-sm btn-danger"
               :disabled="unregistering === s.server_url"
               @click="unregister(s)"
@@ -171,7 +197,7 @@ onMounted(async () => {
         </div>
         <p class="dim tip">
           支持注册多台服务器；在「命令别名」中可为每个别名选择执行的服务器。
-          服务器删除或吊销凭证后，本页会自动感知并更新状态。
+          服务器删除或吊销凭证后，本页会自动感知并更新状态，服务器数据仍会保留，可点击「重新注册」再次申请。
         </p>
       </template>
       <p v-else class="empty-tip">尚未注册任何服务器，在下方填写地址完成注册</p>

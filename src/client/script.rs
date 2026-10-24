@@ -13,7 +13,8 @@ pub fn gen_script(alias: &str) -> Result<std::path::PathBuf> {
     let dir = crate::common::paths::client_data_dir().join("bin");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{alias}.bat"));
-    let content = format!("@\"{}\" run \"{}\" %*\r\n", exe.display(), alias);
+    // `--` 之后的参数（含别名与 %* 透传参数）不再被 clap 解析为选项
+    let content = format!("@\"{}\" run -- \"{}\" %*\r\n", exe.display(), alias);
     std::fs::write(&path, content)?;
     Ok(path)
 }
