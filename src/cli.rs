@@ -26,7 +26,8 @@ pub enum Command {
     Run {
         /// 命令别名
         alias: String,
-        /// 传给远程命令的参数
+        /// 传给远程命令的参数（含 - 开头的选项，原样透传不被 clap 解析）
+        #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
         args: Vec<String>,
     },
     /// 为指定别名生成 exe 脚本到 %USERPROFILE%\.remote-cmd\bin
