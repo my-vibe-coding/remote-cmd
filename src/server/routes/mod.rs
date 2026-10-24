@@ -13,7 +13,10 @@ use crate::server::state::AppState;
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/api/health", get(health))
-        .route("/api/register", post(register::register))
+        .route(
+            "/api/register",
+            post(register::register).delete(register::self_unregister),
+        )
         .route("/api/register/status/{client_id}", get(register::status))
         .route("/api/exec", post(exec::exec))
         .route("/api/admin/login", post(admin::login))

@@ -31,7 +31,6 @@ const shortId = computed(() => {
   <div class="layout">
     <aside class="sidebar">
       <div class="logo">
-        <span class="logo-mark">⌨</span>
         <span>Remote CMD</span>
         <span class="logo-sub">客户端</span>
       </div>
@@ -75,10 +74,6 @@ const shortId = computed(() => {
   font-weight: 700;
   padding: 4px 10px 18px;
   border-bottom: 1px solid var(--border);
-
-  .logo-mark {
-    color: var(--primary);
-  }
 
   .logo-sub {
     font-size: 12px;

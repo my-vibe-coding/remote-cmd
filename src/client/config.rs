@@ -6,32 +6,76 @@ use crate::common::json_file::{load_json, save_json_atomic};
 use crate::common::paths::client_data_dir;
 use crate::common::AppResult;
 
-/// 客户端配置：%USERPROFILE%\.remote-cmd\client\client.json
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ClientConfig {
-    #[serde(default)]
+/// 单台服务器的注册信息
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerReg {
     pub server_url: String,
     #[serde(default)]
-    pub machine_guid: String,
+    pub client_id: String,
     #[serde(default)]
     pub hostname: String,
-    /// 首次注册返回的 client_id，用于轮询
-    #[serde(default)]
-    pub client_id: String,
     #[serde(default)]
     pub token: Option<String>,
     #[serde(default)]
     pub registered: bool,
 }
 
+/// 客户端配置：%USERPROFILE%\.remote-cmd\client\client.json
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ClientConfig {
+    #[serde(default)]
+    pub machine_guid: String,
+    #[serde(default)]
+    pub hostname: String,
+    /// 多服务器注册列表
+    #[serde(default)]
+    pub servers: Vec<ServerReg>,
+    // ---- 旧版单服务器字段：仅用于加载迁移，不再写回 ----
+    #[serde(default, skip_serializing)]
+    pub server_url: String,
+    #[serde(default, skip_serializing)]
+    pub client_id: String,
+    #[serde(default, skip_serializing)]
+    pub token: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub registered: bool,
+}
+
 impl ClientConfig {
     pub fn load() -> AppResult<Self> {
         let path = config_path();
-        Ok(load_json(&path)?.unwrap_or_default())
+        let mut cfg: ClientConfig = load_json(&path)?.unwrap_or_default();
+        // 旧版单服务器配置迁移到 servers
+        if cfg.servers.is_empty() && !cfg.server_url.is_empty() {
+            cfg.servers.push(ServerReg {
+                server_url: cfg.server_url.clone(),
+                client_id: cfg.client_id.clone(),
+                hostname: cfg.hostname.clone(),
+                token: cfg.token.clone(),
+                registered: cfg.registered,
+            });
+            cfg.server_url.clear();
+            cfg.client_id.clear();
+            cfg.token = None;
+            cfg.registered = false;
+            let _ = cfg.save();
+        }
+        Ok(cfg)
     }
 
     pub fn save(&self) -> AppResult<()> {
         save_json_atomic(&config_path(), self)
+    }
+
+    pub fn find_server(&self, url: &str) -> Option<&ServerReg> {
+        self.servers.iter().find(|s| s.server_url == url)
+    }
+
+    /// 默认服务器：第一个已注册的
+    pub fn default_server(&self) -> Option<&ServerReg> {
+        self.servers
+            .iter()
+            .find(|s| s.registered && s.token.is_some())
     }
 }
 
@@ -44,6 +88,9 @@ pub fn config_path() -> PathBuf {
 pub struct AliasDef {
     /// 命令模板，支持 {args} 占位（出现多次每处替换；未出现且 args 非空则追加末尾）
     pub template: String,
+    /// 绑定的执行服务器地址；空/None 表示使用默认服务器
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server: Option<String>,
 }
 
 pub type Aliases = std::collections::BTreeMap<String, AliasDef>;

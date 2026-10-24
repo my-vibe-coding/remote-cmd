@@ -81,6 +81,30 @@ pub async fn register(
     }))
 }
 
+/// DELETE /api/register：客户端凭 token 自助注销（删除注册记录与凭证）
+pub async fn self_unregister(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let token = headers
+        .get("x-client-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    let Some(record) = state.store.find_by_token(token) else {
+        return Err((StatusCode::UNAUTHORIZED, "客户端凭证无效".into()));
+    };
+    let removed = state.store.remove(&record.id).map_err(internal)?;
+    if !removed {
+        return Err((StatusCode::NOT_FOUND, "记录不存在".into()));
+    }
+    state.audit.log(
+        "register.unregister",
+        &record.hostname,
+        Some(serde_json::json!({ "client_id": record.id })),
+    );
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
 /// GET /api/register/status/{client_id}：轮询审批状态
 pub async fn status(
     State(state): State<Arc<AppState>>,

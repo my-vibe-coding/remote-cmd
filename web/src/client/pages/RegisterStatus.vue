@@ -6,58 +6,67 @@ import {
   localApi,
   type HostInfo,
   type LocalStatus,
-  type ModeInfo,
+  type ServerRegInfo,
 } from '../../shared/api'
 import StatusBadge from '../../shared/StatusBadge.vue'
 
 // ---------- 本机信息 ----------
-const info = ref<HostInfo | null>(null)
+const info = ref<HostInfo | null>()
 
-// ---------- 注册状态 ----------
+// ---------- 注册状态（多服务器） ----------
 const status = ref<LocalStatus | null>(null)
-const mode = ref<ModeInfo | null>(null)
 const serverUrl = ref('')
 const submitting = ref(false)
 const errorMsg = ref('')
+const notice = ref('')
 // 申请注册时若直接返回了 token，用于掩码展示
 const regToken = ref('')
+// 正在注销的服务器
+const unregistering = ref('')
 
-const approved = computed(
-  () => status.value?.registered === true || status.value?.status === 'approved',
-)
-const pending = computed(() => !approved.value && status.value?.status === 'pending')
-const rejected = computed(() => status.value?.status === 'rejected')
+const servers = computed<ServerRegInfo[]>(() => status.value?.servers ?? [])
 
-const shortClientId = computed(() => {
-  const id = mode.value?.client_id ?? ''
-  return id ? id.slice(0, 8) + (id.length > 8 ? '…' : '') : '-'
-})
+/** 展示用状态：deleted/unreachable 映射为可显示的徽章 */
+function displayStatus(s: ServerRegInfo): string {
+  if (s.status === 'deleted') return 'revoked'
+  if (s.status === 'unreachable') return 'pending'
+  return s.status || (s.registered ? 'approved' : 'pending')
+}
 
-const tokenMask = computed(() => {
-  const t = regToken.value
-  if (t) return t.slice(0, 6) + '••••••' + t.slice(-4)
-  return mode.value?.has_token ? '已保存在本机' : '-'
-})
+/** 状态说明文字 */
+function statusText(s: ServerRegInfo): string {
+  switch (s.status) {
+    case 'deleted':
+      return '服务器已删除该注册记录'
+    case 'unreachable':
+      return '无法连接服务器'
+    case 'revoked':
+      return '凭证已被管理员吊销'
+    case 'pending':
+      return '等待管理员批准…'
+    case 'rejected':
+      return '注册申请被拒绝'
+    default:
+      return ''
+  }
+}
 
-// ---------- 每 3s 轮询状态直到 approved / rejected ----------
+const shortId = (id: string) => (id ? id.slice(0, 8) + (id.length > 8 ? '…' : '') : '-')
+
+// ---------- 每 3s 轮询：审批结果 / 吊销与删除感知 ----------
 async function pollStatus() {
   try {
-    const s = await localApi.getStatus()
-    status.value = s
-    if (s.registered || s.status === 'approved' || s.status === 'rejected') {
-      stopPolling()
-      if (s.registered || s.status === 'approved') void localApi.getMode().then((m) => (mode.value = m))
-    }
+    status.value = await localApi.getStatus()
   } catch {
     // 网络抖动时忽略，等下一轮
   }
 }
 
-const { pause: stopPolling, resume: startPolling } = useIntervalFn(pollStatus, 3000, {
+const { resume: startPolling } = useIntervalFn(pollStatus, 3000, {
   immediate: false,
 })
 
-// ---------- 提交注册 ----------
+// ---------- 提交注册（可添加多台服务器） ----------
 async function submit() {
   const url = serverUrl.value.trim()
   if (!url) {
@@ -66,12 +75,12 @@ async function submit() {
   }
   submitting.value = true
   errorMsg.value = ''
+  notice.value = ''
   try {
     const r = await localApi.register(url)
     regToken.value = r.token ?? ''
-    const s = await localApi.getStatus()
-    status.value = s
-    if (!(s.registered || s.status === 'approved')) startPolling()
+    serverUrl.value = ''
+    await pollStatus()
   } catch (e) {
     errorMsg.value =
       e instanceof ApiError ? `注册失败 (HTTP ${e.status})：${e.message}` : '注册失败：网络错误'
@@ -80,23 +89,38 @@ async function submit() {
   }
 }
 
+// ---------- 注销 ----------
+async function unregister(s: ServerRegInfo) {
+  const name = s.hostname || s.server_url
+  if (!window.confirm(`确认注销在服务器「${name}」的注册？本机凭证将被删除。`)) return
+  unregistering.value = s.server_url
+  errorMsg.value = ''
+  notice.value = ''
+  try {
+    await localApi.unregisterServer(s.server_url)
+    notice.value = `已注销服务器「${name}」的注册`
+    await pollStatus()
+  } catch (e) {
+    errorMsg.value =
+      e instanceof ApiError ? `注销失败 (HTTP ${e.status})：${e.message}` : '注销失败：网络错误'
+  } finally {
+    unregistering.value = ''
+  }
+}
+
 onMounted(async () => {
   try {
     info.value = await localApi.getInfo()
   } catch {
     /* 本机信息获取失败不阻塞注册流程 */
+    info.value = null
   }
   try {
-    mode.value = await localApi.getMode()
-  } catch {
-    /* 同上 */
-  }
-  try {
-    status.value = await localApi.getStatus()
-    if (!status.value.registered && status.value.status === 'pending') startPolling()
+    await pollStatus()
   } catch {
     errorMsg.value = '无法连接本地服务（/api/local），请确认客户端服务已启动'
   }
+  startPolling()
 })
 </script>
 
@@ -113,58 +137,66 @@ onMounted(async () => {
         <div class="info-item"><span class="dim">操作系统</span><span>{{ info.os }}</span></div>
         <div class="info-item"><span class="dim">当前用户</span><span>{{ info.user }}</span></div>
       </div>
-      <p v-else class="empty-tip">正在获取本机信息…</p>
+      <p v-else-if="info === null" class="empty-tip">
+        <div>获取客户端信息失败, 程序是否以服务模式运行? </div>
+        <div>访问 <a href="/admin" style="color: #007bff;">服务端</a> 页面</div>
+      </p>
+      <p v-else-if="info === undefined" class="empty-tip">正在获取客户端信息…</p>
     </section>
 
-    <!-- 注册流程 -->
+    <!-- 已注册的服务器列表 -->
     <section class="card">
-      <h2 class="card-title">服务器注册</h2>
-
-      <!-- 已批准 -->
-      <template v-if="approved">
-        <div class="reg-row">
-          <StatusBadge status="approved" />
-          <span>已注册并获管理员批准</span>
+      <h2 class="card-title">已注册服务器（{{ servers.length }}）</h2>
+      <p v-if="notice" class="notice-text">{{ notice }}</p>
+      <template v-if="servers.length">
+        <div v-for="s in servers" :key="s.server_url" class="server-row">
+          <div class="server-head">
+            <StatusBadge :status="displayStatus(s)" />
+            <span class="mono server-url">{{ s.server_url }}</span>
+            <button
+              class="btn btn-sm btn-danger"
+              :disabled="unregistering === s.server_url"
+              @click="unregister(s)"
+            >
+              {{ unregistering === s.server_url ? '注销中…' : '注销注册' }}
+            </button>
+          </div>
+          <div class="server-detail">
+            <span class="dim">客户端 ID</span><span class="mono">{{ shortId(s.client_id) }}</span>
+            <span class="dim">状态</span>
+            <span :class="{ 'warn-text': s.status === 'revoked' || s.status === 'deleted' || s.status === 'unreachable' }">
+              {{ s.registered ? '已批准可用' : statusText(s) || '待审批' }}
+            </span>
+          </div>
         </div>
-        <div class="info-grid">
-          <div class="info-item"><span class="dim">服务器地址</span><span class="mono">{{ status?.server_url }}</span></div>
-          <div class="info-item"><span class="dim">客户端 ID</span><span class="mono">{{ shortClientId }}</span></div>
-          <div class="info-item"><span class="dim">凭证</span><span class="mono">{{ tokenMask }}</span></div>
-        </div>
-        <p class="dim tip">凭证由本机安全保管，无需手动配置。现在可以到「命令别名」配置命令，然后去「执行命令」试一试。</p>
+        <p class="dim tip">
+          支持注册多台服务器；在「命令别名」中可为每个别名选择执行的服务器。
+          服务器删除或吊销凭证后，本页会自动感知并更新状态。
+        </p>
       </template>
+      <p v-else class="empty-tip">尚未注册任何服务器，在下方填写地址完成注册</p>
+    </section>
 
-      <!-- 等待批准 -->
-      <template v-else-if="pending">
-        <div class="reg-row">
-          <StatusBadge status="pending" />
-          <span>等待管理员批准…</span>
-        </div>
-        <p class="dim tip">申请已提交到服务器，正在每 3 秒自动查询审批结果，批准后本页会自动更新。</p>
-        <div class="spinner"></div>
-      </template>
-
-      <!-- 表单：未注册 / 被拒绝后重新申请 -->
-      <template v-else>
-        <div v-if="rejected" class="reg-row">
-          <StatusBadge status="rejected" />
-          <span>注册申请被拒绝，可修改地址后重新申请</span>
-        </div>
-        <div class="form-row">
-          <input
-            v-model="serverUrl"
-            class="input grow"
-            type="text"
-            placeholder="服务器地址，如 https://192.168.1.100:3233"
-            :disabled="submitting"
-            @keyup.enter="submit"
-          />
-          <button class="btn btn-primary" :disabled="submitting" @click="submit">
-            {{ submitting ? '提交中…' : '申请注册' }}
-          </button>
-        </div>
-        <p v-if="errorMsg" class="error-text">{{ errorMsg }}</p>
-      </template>
+    <!-- 注册新服务器 -->
+    <section class="card">
+      <h2 class="card-title">注册新服务器</h2>
+      <div class="form-row">
+        <input
+          v-model="serverUrl"
+          class="input grow"
+          type="text"
+          placeholder="服务器地址，如 https://192.168.1.100:3233"
+          :disabled="submitting"
+          @keyup.enter="submit"
+        />
+        <button class="btn btn-primary" :disabled="submitting" @click="submit">
+          {{ submitting ? '提交中…' : '申请注册' }}
+        </button>
+      </div>
+      <p v-if="regToken" class="dim tip">
+        注册已获批准，凭证已保存在本机（{{ regToken.slice(0, 6) }}••••••{{ regToken.slice(-4) }}）
+      </p>
+      <p v-if="errorMsg" class="error-text">{{ errorMsg }}</p>
     </section>
   </div>
 </template>
@@ -195,11 +227,37 @@ onMounted(async () => {
   font-size: 14px;
 }
 
-.reg-row {
+.server-row {
+  padding: 12px 0;
+  border-bottom: 1px dashed var(--border);
+
+  &:last-of-type {
+    border-bottom: none;
+  }
+}
+
+.server-head {
   display: flex;
   align-items: center;
-  gap: 10px;
-  margin-bottom: 8px;
+  gap: 12px;
+}
+
+.server-url {
+  flex: 1;
+  font-size: 13px;
+}
+
+.server-detail {
+  display: grid;
+  grid-template-columns: 80px 1fr;
+  gap: 4px 16px;
+  margin-top: 8px;
+  padding-left: 4px;
+  font-size: 13px;
+}
+
+.warn-text {
+  color: var(--warning);
 }
 
 .form-row {
@@ -217,24 +275,14 @@ onMounted(async () => {
   line-height: 1.6;
 }
 
+.notice-text {
+  color: var(--success);
+  margin: 8px 0;
+  font-size: 13px;
+}
+
 .error-text {
   color: var(--danger);
   margin: 12px 0 0;
-}
-
-.spinner {
-  width: 22px;
-  height: 22px;
-  margin-top: 14px;
-  border: 3px solid var(--border);
-  border-top-color: var(--primary);
-  border-radius: 50%;
-  animation: spin 0.9s linear infinite;
-}
-
-@keyframes spin {
-  to {
-    transform: rotate(360deg);
-  }
 }
 </style>

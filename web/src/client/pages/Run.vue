@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { ToolPanel, ToolPanelManager } from '@develon/webui-panel'
-import { ApiError, localApi } from '../../shared/api'
+import { ApiError, localApi, type AliasDefInfo, type ServerRegInfo } from '../../shared/api'
 import {
   consumeSse,
   decodeBase64Utf8,
@@ -31,7 +31,8 @@ interface RunItem {
   durationMs: number | null
 }
 
-const aliases = ref<Record<string, { template: string }>>({})
+const aliases = ref<Record<string, AliasDefInfo>>({})
+const servers = ref<ServerRegInfo[]>([])
 const alias = ref('')
 const argsText = ref('')
 const formError = ref('')
@@ -39,6 +40,14 @@ const runs = reactive<RunItem[]>([])
 let nextId = 1
 
 const aliasNames = computed(() => Object.keys(aliases.value))
+
+/** 别名绑定服务器的显示名（未绑定返回空串 = 默认服务器） */
+function boundServerLabel(name: string): string {
+  const url = aliases.value[name]?.server
+  if (!url) return ''
+  const s = servers.value.find((x) => x.server_url === url)
+  return s?.hostname || url
+}
 
 // 面板初始位置按序号错开，避免完全重叠（之后仍可拖拽）
 function panelStyle(id: number) {
@@ -52,6 +61,11 @@ async function load() {
     if (!alias.value && aliasNames.value.length) alias.value = aliasNames.value[0]
   } catch {
     /* 别名加载失败不阻塞手动输入 */
+  }
+  try {
+    servers.value = (await localApi.getServers()).servers
+  } catch {
+    /* 服务器列表加载失败不影响执行 */
   }
 }
 
@@ -79,11 +93,17 @@ async function run() {
   formError.value = ''
   const args = argsText.value.trim() ? argsText.value.trim().split(/\s+/) : []
 
+  const serverLabel = boundServerLabel(alias.value)
   const item = reactive<RunItem>({
     id: nextId++,
     title: `${alias.value} · ${nowShort()}`,
     alias: alias.value,
-    lines: [{ kind: 'sys', text: `▶ ${alias.value}${args.length ? ' ' + args.join(' ') : ''}` }],
+    lines: [
+      {
+        kind: 'sys',
+        text: `▶ ${serverLabel ? `[${serverLabel}] ` : ''}${alias.value}${args.length ? ' ' + args.join(' ') : ''}`,
+      },
+    ],
     running: true,
     finished: false,
     exitCode: null,
@@ -176,7 +196,7 @@ onBeforeUnmount(() => {
         <button class="btn btn-primary" :disabled="!alias" @click="run">执行</button>
       </div>
       <p class="dim tip">
-        参数将按空格拆分后传给后端，替换模板中的 <code>{'{'}args{'}'}</code> 占位符。
+        参数将按空格拆分后传给后端，替换模板中的 <code>{args}</code> 占位符。
         每次执行会新开一个输出面板，可同时运行多个命令互不干扰；面板支持拖拽、缩放，最小化后可从底部任务栏恢复。
       </p>
       <p v-if="formError" class="error-text">{{ formError }}</p>

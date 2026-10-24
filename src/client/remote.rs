@@ -28,9 +28,12 @@ pub enum SseEvent {
         data_b64: String,
     },
     Exit {
+        #[allow(dead_code)]
         exit_code: Option<i32>,
         timeout: bool,
+        #[allow(dead_code)]
         duration_ms: u64,
+        #[allow(dead_code)]
         truncated: bool,
     },
 }
@@ -132,6 +135,17 @@ pub async fn register_status(server_url: &str, client_id: &str) -> Result<Value>
         .await?
         .error_for_status()?;
     Ok(resp.json().await?)
+}
+
+/// DELETE /api/register：客户端凭 token 自助注销
+pub async fn unregister(server_url: &str, token: &str) -> Result<()> {
+    http_client()
+        .delete(format!("{server_url}/api/register"))
+        .header("X-Client-Token", token)
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(())
 }
 
 /// POST /api/exec，返回 SSE Response 供消费

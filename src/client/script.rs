@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 
-use super::config::{load_aliases, AliasDef};
+use super::config::load_aliases;
 
 /// 生成 bat 脚本到 %USERPROFILE%\.remote-cmd\bin\<别名>.bat
 /// 内容: @"<本 exe>" run <别名> %*
@@ -63,6 +63,3 @@ pub fn validate_template(template: &str) -> Result<()> {
     }
     Ok(())
 }
-
-#[allow(unused)]
-fn _keep_alias_def(_d: &AliasDef) {}

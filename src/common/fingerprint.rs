@@ -56,11 +56,10 @@ fn machine_guid() -> String {
         {
             let text = String::from_utf8_lossy(&out.stdout);
             for line in text.lines() {
-                if let Some(idx) = line.find("MachineGuid") {
-                    if let Some(val) = line[idx + "MachineGuid".len()..].trim().split_whitespace().last() {
+                if let Some(idx) = line.find("MachineGuid")
+                    && let Some(val) = line[idx + "MachineGuid".len()..].split_whitespace().last() {
                         return val.to_string();
                     }
-                }
             }
         }
         // reg query 失败时退化为 hostname，保证仍可用

@@ -5,7 +5,6 @@ use chrono::Utc;
 use serde::Deserialize;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use uuid::Uuid;
 
 use crate::common::crypto;
 use crate::server::auth::AdminAuth;

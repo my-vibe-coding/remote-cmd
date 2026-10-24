@@ -17,14 +17,13 @@ pub async fn static_handler(uri: Uri, _req: Request) -> Result<Response, Infalli
             .body(Body::from(bytes))
             .unwrap());
     }
-    if !path.starts_with("/api/") {
-        if let Some((bytes, mime)) = embed::fallback(path) {
+    if !path.starts_with("/api/")
+        && let Some((bytes, mime)) = embed::fallback(path) {
             return Ok(Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, mime)
                 .body(Body::from(bytes))
                 .unwrap());
         }
-    }
     Ok((StatusCode::NOT_FOUND, Html("<h1>404 Not Found</h1>".to_string())).into_response())
 }

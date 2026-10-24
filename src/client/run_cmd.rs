@@ -1,38 +1,14 @@
-use std::collections::BTreeMap;
-
 use anyhow::{anyhow, Result};
 use serde_json::json;
 
-use super::config::{load_aliases, render_template, ClientConfig};
+use super::config::{load_aliases, render_template, ClientConfig, ServerReg};
 use super::remote::{consume_sse, exec_sse, SseEvent};
 
 /// `remote-cmd run <别名> [args...]`：读取本地配置 → 模板渲染 → 转发执行 → 流式输出 → 透传退出码
 pub async fn run(alias: &str, args: &[String]) -> Result<()> {
-    let config = ClientConfig::load()?;
-    if !config.registered || config.token.is_none() {
-        anyhow::bail!("尚未注册，请先启动 remote-cmd 完成注册申请");
-    }
-    let server_url = if config.server_url.is_empty() {
-        anyhow::bail!("未配置服务器地址，请先启动 remote-cmd 完成配置")
-    } else {
-        config.server_url.clone()
-    };
+    let (server, body) = resolve_exec_target(alias, args)?;
 
-    let aliases: BTreeMap<String, _> = load_aliases()?;
-    let Some(def) = aliases.get(alias) else {
-        anyhow::bail!("别名不存在: {alias}，请先在客户端页面创建");
-    };
-    let cmdline = render_template(&def.template, args);
-    let Some((program, rest)) = super::config::parse_command_line(&cmdline) else {
-        anyhow::bail!("命令模板无效: {cmdline}");
-    };
-
-    let body = json!({
-        "program": program,
-        "args": rest,
-    });
-
-    let resp = exec_sse(&server_url, config.token.as_deref().unwrap(), &body).await;
+    let resp = exec_sse(&server.server_url, server.token.as_deref().unwrap_or_default(), &body).await;
     let resp = match resp {
         Ok(r) => r,
         Err(e) => anyhow::bail!("请求服务器失败: {e}"),
@@ -73,8 +49,9 @@ pub async fn run(alias: &str, args: &[String]) -> Result<()> {
     }
 }
 
-/// 供本地页面 /api/local/exec 使用的共享逻辑：返回 SSE 字节流前的校验
-pub fn resolve_alias(alias: &str, args: &[String]) -> Result<serde_json::Value> {
+/// 解析别名的执行目标：别名绑定的服务器优先，否则使用默认（第一个已注册）服务器。
+/// 返回 (目标服务器, exec 请求体)
+pub fn resolve_exec_target(alias: &str, args: &[String]) -> Result<(ServerReg, serde_json::Value)> {
     let aliases = load_aliases()?;
     let Some(def) = aliases.get(alias) else {
         return Err(anyhow!("别名不存在: {alias}"));
@@ -83,5 +60,18 @@ pub fn resolve_alias(alias: &str, args: &[String]) -> Result<serde_json::Value> 
     let Some((program, rest)) = super::config::parse_command_line(&cmdline) else {
         return Err(anyhow!("命令模板无效: {cmdline}"));
     };
-    Ok(json!({ "program": program, "args": rest }))
+
+    let config = ClientConfig::load()?;
+    let server = match def.server.as_deref().filter(|s| !s.is_empty()) {
+        Some(url) => config
+            .find_server(url)
+            .filter(|s| s.registered && s.token.is_some())
+            .cloned()
+            .ok_or_else(|| anyhow!("别名绑定的服务器不可用: {url}，请重新注册或修改别名"))?,
+        None => config
+            .default_server()
+            .cloned()
+            .ok_or_else(|| anyhow!("尚未注册任何服务器，请先完成注册"))?,
+    };
+    Ok((server, json!({ "program": program, "args": rest })))
 }

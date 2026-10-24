@@ -11,6 +11,7 @@ export interface ModeInfo {
   registered: boolean
   client_id: string
   has_token: boolean
+  servers: ServerRegInfo[]
 }
 
 /** GET /api/local/info */
@@ -28,12 +29,29 @@ export interface RegisterResult {
   token?: string
 }
 
+/** 单台服务器的注册信息 */
+export interface ServerRegInfo {
+  server_url: string
+  client_id: string
+  hostname: string
+  registered: boolean
+  /** approved / pending / rejected / revoked / deleted / unreachable */
+  status?: string
+}
+
 /** GET /api/local/status */
 export interface LocalStatus {
   registered: boolean
-  status?: string
   server_url: string
   hostname: string
+  servers: ServerRegInfo[]
+}
+
+/** 命令别名定义 */
+export interface AliasDefInfo {
+  template: string
+  /** 绑定的执行服务器；空 = 默认服务器 */
+  server?: string | null
 }
 
 /** 注册/凭证记录（registrations 与 credentials 接口结构相同） */
@@ -122,16 +140,27 @@ export const localApi = {
   register: (serverUrl: string) =>
     localRequest<RegisterResult>('POST', '/api/local/server/register', { server_url: serverUrl }),
 
-  /** 注册状态（后端持续轮询远端） */
+  /** 注册状态（后端持续轮询远端，感知审批/吊销/删除） */
   getStatus: () => localRequest<LocalStatus>('GET', '/api/local/status'),
+
+  /** 已注册服务器列表（轻量，不查询远端） */
+  getServers: () => localRequest<{ servers: ServerRegInfo[] }>('GET', '/api/local/servers'),
 
   /** 别名列表 */
   getAliases: () =>
-    localRequest<Record<string, { template: string }>>('GET', '/api/local/aliases'),
+    localRequest<Record<string, AliasDefInfo>>('GET', '/api/local/aliases'),
 
-  /** 创建/更新别名（template 支持 {args} 占位） */
-  putAlias: (name: string, template: string) =>
-    localRequest<{ ok: boolean }>('PUT', '/api/local/aliases', { name, template }),
+  /** 创建/更新别名（template 支持 {args} 占位；server 为绑定的执行服务器，空 = 默认） */
+  putAlias: (name: string, template: string, server?: string | null) =>
+    localRequest<{ ok: boolean }>('PUT', '/api/local/aliases', {
+      name,
+      template,
+      server: server || null,
+    }),
+
+  /** 注销某台服务器的注册（远端删除记录 + 移除本地凭证） */
+  unregisterServer: (serverUrl: string) =>
+    localRequest<{ ok: boolean }>('POST', '/api/local/server/unregister', { server_url: serverUrl }),
 
   /** 删除别名 */
   deleteAlias: (name: string) =>

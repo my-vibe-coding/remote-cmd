@@ -11,6 +11,7 @@ use super::store::{Audit, Store};
 pub const SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
 
 pub struct AppState {
+    #[allow(dead_code)]
     pub data_dir: PathBuf,
     pub store: Store,
     pub audit: Arc<Audit>,

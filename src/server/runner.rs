@@ -143,9 +143,17 @@ async fn pump<R: tokio::io::AsyncRead + Unpin>(
     truncated: Arc<AtomicBool>,
 ) {
     let mut buf = [0u8; 4096];
+    let mut transcoder = OutputTranscoder::new();
     loop {
         match reader.read(&mut buf).await {
-            Ok(0) | Err(_) => break,
+            Ok(0) | Err(_) => {
+                // 冲刷转码器尾部（未完成的多字节序列）
+                let tail = transcoder.feed(&[], true);
+                if !tail.is_empty() {
+                    let _ = send_output(&tx, stream, tail.as_bytes()).await;
+                }
+                break;
+            }
             Ok(n) => {
                 let prev = total.fetch_add(n as u64, Ordering::Relaxed);
                 if prev >= MAX_OUTPUT_BYTES {
@@ -160,21 +168,92 @@ async fn pump<R: tokio::io::AsyncRead + Unpin>(
                     }
                     continue;
                 }
-                let b64 = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
-                if tx
-                    .send(ExecEvent::Output {
-                        stream,
-                        data_b64: b64,
-                    })
-                    .await
-                    .is_err()
-                {
+                let text = transcoder.feed(&buf[..n], false);
+                if !send_output(&tx, stream, text.as_bytes()).await {
                     // 接收端关闭（客户端断连）
                     break;
                 }
             }
         }
     }
+}
+
+async fn send_output(
+    tx: &mpsc::Sender<ExecEvent>,
+    stream: &'static str,
+    bytes: &[u8],
+) -> bool {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+    tx.send(ExecEvent::Output {
+        stream,
+        data_b64: b64,
+    })
+    .await
+    .is_ok()
+}
+
+/// 子进程输出转码器：Windows 控制台程序多以 OEM 代码页（中文系统为 GBK/cp936）输出，
+/// 而 UTF-8 程序（node/git/python 等）输出 UTF-8。首块按严格 UTF-8 校验判定编码，
+/// 之后用有状态解码器处理跨块的多字节序列，统一转为 UTF-8。
+struct OutputTranscoder {
+    dec: Option<encoding_rs::Decoder>,
+    legacy: Option<&'static encoding_rs::Encoding>,
+}
+
+impl OutputTranscoder {
+    fn new() -> Self {
+        OutputTranscoder { dec: None, legacy: oem_encoding() }
+    }
+
+    fn feed(&mut self, bytes: &[u8], last: bool) -> String {
+        if self.dec.is_none() {
+            if bytes.is_empty() {
+                return String::new();
+            }
+            // error_len() == None 表示仅尾部多字节序列被截断，仍视为 UTF-8
+            let is_utf8 = match std::str::from_utf8(bytes) {
+                Ok(_) => true,
+                Err(e) => e.error_len().is_none(),
+            };
+            let enc = if is_utf8 {
+                encoding_rs::UTF_8
+            } else {
+                self.legacy.unwrap_or(encoding_rs::UTF_8)
+            };
+            self.dec = Some(enc.new_decoder());
+        }
+        let mut dec = self.dec.take().unwrap();
+        let mut out = String::new();
+        let src = bytes;
+        loop {
+            out.reserve(src.len() * 3 + 16);
+            match dec.decode_to_string(src, &mut out, last).0 {
+                encoding_rs::CoderResult::InputEmpty => break,
+                encoding_rs::CoderResult::OutputFull => continue,
+            }
+        }
+        self.dec = Some(dec);
+        out
+    }
+}
+
+/// Windows OEM 代码页 → encoding_rs；非 Windows 或未知代码页返回 None（按 UTF-8）
+#[cfg(windows)]
+fn oem_encoding() -> Option<&'static encoding_rs::Encoding> {
+    let cp = unsafe { windows_sys::Win32::Globalization::GetOEMCP() };
+    Some(match cp {
+        936 => encoding_rs::GBK,
+        950 => encoding_rs::BIG5,
+        932 => encoding_rs::SHIFT_JIS,
+        949 => encoding_rs::EUC_KR,
+        1252 => encoding_rs::WINDOWS_1252,
+        _ => return None,
+    })
+}
+
+#[cfg(not(windows))]
+fn oem_encoding() -> Option<&'static encoding_rs::Encoding> {
+    None
 }
 
 /// 白名单匹配：程序名（取文件名部分）与白名单条目不区分大小写比较
@@ -185,4 +264,60 @@ pub fn whitelist_matches(whitelist: &[String], program: &str) -> bool {
         .unwrap_or_else(|| program.to_string());
     let name = name.to_lowercase();
     whitelist.iter().any(|entry| entry.trim().to_lowercase() == name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transcodes_gbk_split_across_chunks() {
+        // "测试中文GBK输出" 的 GBK 编码（cp936）
+        let gbk: &[u8] = &[
+            0xB2, 0xE2, 0xCA, 0xD4, 0xD6, 0xD0, 0xCE, 0xC4, // 测试中文
+            b'G', b'B', b'K',
+            0xCA, 0xE4, 0xB3, 0xF6, // 输出
+        ];
+        let mut t = OutputTranscoder { dec: None, legacy: Some(encoding_rs::GBK) };
+        // 在多字节序列中间切开，模拟管道读取的任意分块
+        let mid = 5;
+        let mut out = t.feed(&gbk[..mid], false);
+        out.push_str(&t.feed(&gbk[mid..], true));
+        assert_eq!(out, "测试中文GBK输出");
+    }
+
+    #[test]
+    fn passes_utf8_through_and_joins_split_sequence() {
+        let utf8 = "hello 你好 world".as_bytes();
+        let mut t = OutputTranscoder { dec: None, legacy: Some(encoding_rs::GBK) };
+        let mid = "hello 你".len(); // 切在 UTF-8 多字节序列中间
+        let mut out = t.feed(&utf8[..mid], false);
+        out.push_str(&t.feed(&utf8[mid..], true));
+        assert_eq!(out, "hello 你好 world");
+    }
+
+    #[test]
+    fn utf8_detected_even_with_legacy_available() {
+        // UTF-8 程序（node/git）输出不应被误判为 GBK
+        let utf8 = "中文 utf-8 content".as_bytes();
+        let mut t = OutputTranscoder { dec: None, legacy: Some(encoding_rs::GBK) };
+        assert_eq!(t.feed(utf8, true), "中文 utf-8 content");
+    }
+
+    #[test]
+    fn gbk_detected_when_invalid_utf8() {
+        // GBK 字节不是合法 UTF-8，应走 legacy 解码
+        let gbk: &[u8] = &[0xD6, 0xD0, 0xCE, 0xC4]; // 中文
+        let mut t = OutputTranscoder { dec: None, legacy: Some(encoding_rs::GBK) };
+        assert_eq!(t.feed(gbk, true), "中文");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn oem_encoding_resolved_on_windows() {
+        // 中文 Windows 上 OEM CP 为 936（GBK）
+        let enc = oem_encoding();
+        assert!(enc.is_some());
+        assert_eq!(enc.unwrap().name(), encoding_rs::GBK.name());
+    }
 }
