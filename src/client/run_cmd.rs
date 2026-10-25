@@ -10,25 +10,20 @@ use super::config::{load_aliases, render_template, ClientConfig, ServerReg};
 use super::remote::{parse_frame, resize_msg, ws_exec, ExecFrame, ExecWs, STDIN_CLOSE};
 
 /// `remote-cmd run <别名> [args...]`：读取本地配置 → 模板渲染 → WS 会话 → stdin 转发 + 流式输出 → 透传退出码
-pub async fn run(alias: &str, args: &[String], interactive: bool) -> Result<()> {
+pub async fn run(alias: &str, args: &[String]) -> Result<()> {
     let (server, body) = resolve_exec_target(alias, args)?;
     let program = body["program"].as_str().unwrap_or_default().to_string();
     let cmd_args: Vec<String> = serde_json::from_value(body["args"].clone())?;
 
-    // 本地 stdin 为终端且 -i → PTY 附加会话（raw mode + resize 同步，无超时）；
-    // 其余保持管道/行模式（非交互走服务端默认超时，交互放宽到最大超时）
-    let pty = interactive && std::io::stdin().is_terminal();
-    let timeout_secs = if !pty && interactive {
-        Some(crate::server::runner::MAX_TIMEOUT_SECS)
-    } else {
-        None
-    };
+    // 本地 stdin 为终端 → PTY 附加会话（raw mode + resize 同步，无超时）；
+    // 管道 stdin → 字节流转发 + 流式输出（服务端默认超时）
+    let pty = std::io::stdin().is_terminal();
     let ExecWs { sink, stream } = match ws_exec(
         &server.server_url,
         server.token.as_deref().unwrap_or_default(),
         &program,
         &cmd_args,
-        timeout_secs,
+        None,
         pty,
     )
     .await
@@ -41,14 +36,8 @@ pub async fn run(alias: &str, args: &[String], interactive: bool) -> Result<()> 
         return run_pty_session(sink, stream).await;
     }
 
-    // stdin 策略：管道 → 转发原始字节；TTY+(-i) → 行模式；TTY 无 -i → 立即 EOF
-    let mut stdin_task = None;
-    if !std::io::stdin().is_terminal() || interactive {
-        stdin_task = Some(spawn_stdin_pump(sink, interactive));
-    } else {
-        let mut sink = sink;
-        let _ = sink.send(WsMessage::Text(STDIN_CLOSE.into())).await;
-    }
+    // 管道 stdin → 转发原始字节，EOF 时发 stdin_close
+    let stdin_task = spawn_stdin_pump(sink);
 
     // 输出泵：Binary 按 tag 分流；Exit 取退出码
     let mut exit_code: Option<i32> = None;
@@ -83,9 +72,7 @@ pub async fn run(alias: &str, args: &[String], interactive: bool) -> Result<()> 
         }
     }
 
-    if let Some(task) = stdin_task {
-        task.abort();
-    }
+    stdin_task.abort();
 
     match exit_code {
         Some(code) => std::process::exit(code),
@@ -97,35 +84,20 @@ pub async fn run(alias: &str, args: &[String], interactive: bool) -> Result<()> 
     }
 }
 
-/// stdin 泵：阻塞读本地 stdin（管道字节流 / TTY 行模式）→ WS Binary 帧 → 本地 EOF 时发 stdin_close
+/// stdin 泵：阻塞读本地 stdin（管道字节流）→ WS Binary 帧 → 本地 EOF 时发 stdin_close
 fn spawn_stdin_pump(
     mut sink: futures::stream::SplitSink<super::remote::WsStream, WsMessage>,
-    interactive: bool,
 ) -> tokio::task::JoinHandle<()> {
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(16);
     let reader = tokio::task::spawn_blocking(move || {
         let mut stdin = std::io::stdin();
-        if interactive {
-            for line in std::io::BufRead::lines(std::io::BufReader::new(stdin)) {
-                match line {
-                    Ok(mut l) => {
-                        l.push('\n');
-                        if tx.blocking_send(l.into_bytes()).is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-        } else {
-            let mut buf = [0u8; 4096];
-            loop {
-                match stdin.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if tx.blocking_send(buf[..n].to_vec()).is_err() {
-                            break;
-                        }
+        let mut buf = [0u8; 4096];
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.blocking_send(buf[..n].to_vec()).is_err() {
+                        break;
                     }
                 }
             }

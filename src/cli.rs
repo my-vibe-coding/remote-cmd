@@ -26,10 +26,6 @@ pub enum Command {
     Run {
         /// 命令别名
         alias: String,
-        /// 交互模式：本地为终端时附加到远端 PTY（全屏程序可用，Ctrl+] 脱离）；
-        /// 本地为管道时逐行转发 stdin（需放在别名之前）
-        #[arg(short = 'i', long)]
-        interactive: bool,
         /// 传给远程命令的参数（含 - 开头的选项，原样透传不被 clap 解析）
         #[arg(allow_hyphen_values = true, trailing_var_arg = true)]
         args: Vec<String>,
