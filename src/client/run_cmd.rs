@@ -180,7 +180,11 @@ async fn run_pty_session(
         }
     });
 
-    // 输出泵：PTY 输出为原始 ANSI 字节，直接写本地终端
+    // 输出泵：PTY 输出为原始 ANSI 字节，直接写本地终端；
+    // 过滤终端查询序列（CPR/DA）：本地终端会自动应答并注入输入缓冲，
+    // 经 crossterm 拆成按键事件转发后会污染远端输入（vim 显示 [3;1R 等）。
+    // 查询由服务端 CPR 自动应答处理，本地不应答。
+    let mut query_filter = QueryFilter::new();
     let mut exit_code: Option<i32> = None;
     let mut detached = false;
     loop {
@@ -188,9 +192,12 @@ async fn run_pty_session(
             maybe = stream.next() => match maybe {
                 Some(Ok(frame)) => match parse_frame(frame) {
                     Some(ExecFrame::Output { data, .. }) => {
-                        let mut out = std::io::stdout();
-                        let _ = out.write_all(&data);
-                        let _ = out.flush();
+                        let filtered = query_filter.feed(&data);
+                        if !filtered.is_empty() {
+                            let mut out = std::io::stdout();
+                            let _ = out.write_all(&filtered);
+                            let _ = out.flush();
+                        }
                     }
                     Some(ExecFrame::Exit { exit_code: code, .. }) => {
                         exit_code = code;
@@ -209,6 +216,14 @@ async fn run_pty_session(
                 break;
             }
         }
+    }
+
+    // 冲刷过滤器尾部（未完成的转义序列按原样输出）
+    let tail = query_filter.flush();
+    if !tail.is_empty() {
+        let mut out = std::io::stdout();
+        let _ = out.write_all(&tail);
+        let _ = out.flush();
     }
 
     forward.abort();
@@ -234,6 +249,49 @@ struct RawModeGuard;
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+/// 终端查询序列过滤器：从 PTY 输出流中移除会触发本地终端自动应答的查询。
+/// CPR（DSR 光标位置）与 DA（设备属性）查询由服务端应答，本地不应答，
+/// 否则本地应答经按键转发回远端会成为垃圾输入。
+/// 支持查询序列跨块到达（保留尾部前缀等待下一块）。
+struct QueryFilter {
+    tail: Vec<u8>,
+}
+
+impl QueryFilter {
+    /// 需要过滤的查询序列（本地终端会应答的）
+    const PATTERNS: [&'static [u8]; 4] = [b"\x1b[6n", b"\x1b[?6n", b"\x1b[c", b"\x1b[>c"];
+
+    fn new() -> Self {
+        QueryFilter { tail: Vec::new() }
+    }
+
+    fn feed(&mut self, data: &[u8]) -> Vec<u8> {
+        let mut buf = std::mem::take(&mut self.tail);
+        buf.extend_from_slice(data);
+        let mut out = Vec::with_capacity(buf.len());
+        let mut i = 0;
+        while i < buf.len() {
+            let rest = &buf[i..];
+            let matched = Self::PATTERNS.iter().find(|p| rest.starts_with(**p)).map(|p| p.len());
+            if let Some(len) = matched {
+                i += len;
+            } else if Self::PATTERNS.iter().any(|p| p.starts_with(rest)) {
+                // rest 是某查询序列的真前缀 → 保留等待下一块
+                break;
+            } else {
+                out.push(buf[i]);
+                i += 1;
+            }
+        }
+        self.tail = buf[i..].to_vec();
+        out
+    }
+
+    fn flush(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.tail)
     }
 }
 
