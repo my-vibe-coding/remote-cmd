@@ -343,7 +343,7 @@ fn maybe_cpr_fallback(seq: &[u8], tx: &mpsc::Sender<StdinMsg>, answered: &Arc<At
         tokio::time::sleep(Duration::from_millis(1500)).await;
         // 中继应答（任何 CPR 样式数据）会置位 answered；未置位才兜底
         if !answered.swap(true, Ordering::Relaxed) {
-            let _ = tx.blocking_send(StdinMsg::Data(b"\x1b[1;1R".to_vec()));
+            let _ = tx.send(StdinMsg::Data(b"\x1b[1;1R".to_vec())).await;
         }
     });
 }
