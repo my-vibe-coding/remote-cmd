@@ -26,6 +26,15 @@ pub type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 /// stdin EOF 文本帧（协议见 .trae/documents/stdin-implementation-plan.md）
 pub const STDIN_CLOSE: &str = "{\"type\":\"stdin_close\"}";
 
+/// resize 文本帧：请求调整远端 PTY 尺寸
+pub fn resize_msg(cols: u16, rows: u16) -> WsMessage {
+    WsMessage::Text(
+        serde_json::json!({ "type": "resize", "cols": cols, "rows": rows })
+            .to_string()
+            .into(),
+    )
+}
+
 /// 拆分后的执行会话：sink 用于 stdin，stream 用于读取输出
 pub struct ExecWs {
     pub sink:
@@ -102,6 +111,7 @@ pub async fn ws_exec(
     program: &str,
     args: &[String],
     timeout_secs: Option<u64>,
+    tty: bool,
 ) -> Result<ExecWs> {
     let url = server_url
         .replacen("https://", "wss://", 1)
@@ -119,6 +129,7 @@ pub async fn ws_exec(
         "program": program,
         "args": args,
         "timeout_secs": timeout_secs,
+        "tty": tty,
     });
     sink.send(WsMessage::Text(init.to_string().into())).await?;
 

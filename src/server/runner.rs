@@ -19,6 +19,9 @@ pub struct ExecRequest {
     pub args: Vec<String>,
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// PTY 会话：伪终端 + ANSI 原样透传，无 stdout/stderr 区分、无输出截断、无超时
+    #[serde(default)]
+    pub tty: bool,
 }
 
 /// SSE 事件负载
@@ -37,12 +40,14 @@ pub enum ExecEvent {
     },
 }
 
-/// stdin 转发消息：Data 为数据块，Eof 表示关闭子进程 stdin（drop Sender 等价于 Eof）
+/// stdin 转发消息：Data 为数据块，Eof 表示关闭子进程 stdin（drop Sender 等价于 Eof），
+/// Resize 请求调整 PTY 尺寸（非 PTY 会话中被忽略）
 #[derive(Debug)]
 pub enum StdinMsg {
     Data(Vec<u8>),
     #[allow(dead_code)] // 协议层保留：测试与未来调用方使用
     Eof,
+    Resize { cols: u16, rows: u16 },
 }
 
 /// 启动子进程（stdin 已接管）：返回 (输出事件流, stdin 发送端)。
@@ -54,9 +59,15 @@ pub fn spawn_exec_stdin(req: &ExecRequest) -> (mpsc::Receiver<ExecEvent>, mpsc::
         program: req.program.clone(),
         args: req.args.clone(),
         timeout_secs: req.timeout_secs,
+        tty: req.tty,
     };
+    let stx_pty = stx.clone();
     tokio::spawn(async move {
-        run(req, tx, srx).await;
+        if req.tty {
+            run_pty(req, tx, stx_pty, srx).await;
+        } else {
+            run(req, tx, srx).await;
+        }
     });
     (rx, stx)
 }
@@ -101,6 +112,7 @@ async fn run(req: ExecRequest, tx: mpsc::Sender<ExecEvent>, mut stdin_rx: mpsc::
                         }
                     }
                     StdinMsg::Eof => break,
+                    StdinMsg::Resize { .. } => {} // 非 PTY 会话忽略 resize
                 }
             }
             let _ = sin.shutdown().await;
@@ -315,6 +327,186 @@ pub fn whitelist_matches(whitelist: &[String], program: &str) -> bool {
     whitelist.iter().any(|entry| entry.trim().to_lowercase() == name)
 }
 
+/// PTY 会话：伪终端 + ANSI 原样透传（Windows ConPTY / Unix openpty）。
+/// 无 stdout/stderr 区分（stream="pty"）、无输出截断、无超时；客户端断连时 kill 子进程。
+/// stdin_tx 供 CPR 自动应答使用（ConPTY 启动时发送 ESC[6n 并阻塞等待应答，node-pty 同款处理）。
+async fn run_pty(
+    req: ExecRequest,
+    tx: mpsc::Sender<ExecEvent>,
+    stdin_tx: mpsc::Sender<StdinMsg>,
+    mut stdin_rx: mpsc::Receiver<StdinMsg>,
+) {
+    use portable_pty::{CommandBuilder, PtySize};
+
+    let started = Instant::now();
+    let pty_system = portable_pty::native_pty_system();
+    let pair = match pty_system.openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }) {
+        Ok(p) => p,
+        Err(err) => {
+            macro_log::w!("创建伪终端失败 {}: {err}", req.program);
+            let _ = tx
+                .send(ExecEvent::Exit {
+                    exit_code: None,
+                    timeout: false,
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    truncated: false,
+                })
+                .await;
+            return;
+        }
+    };
+
+    let mut cmd = CommandBuilder::new(&req.program);
+    cmd.args(&req.args);
+    let mut child = match pair.slave.spawn_command(cmd) {
+        Ok(c) => c,
+        Err(err) => {
+            macro_log::w!("PTY 启动进程失败 {}: {err}", req.program);
+            let _ = tx
+                .send(ExecEvent::Exit {
+                    exit_code: None,
+                    timeout: false,
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    truncated: false,
+                })
+                .await;
+            return;
+        }
+    };
+    drop(pair.slave); // 父进程立即释放 slave 端
+
+    let reader = match pair.master.try_clone_reader() {
+        Ok(r) => r,
+        Err(err) => {
+            macro_log::w!("PTY 读取端获取失败 {}: {err}", req.program);
+            let _ = child.clone_killer().kill();
+            let _ = tx
+                .send(ExecEvent::Exit {
+                    exit_code: None,
+                    timeout: false,
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    truncated: false,
+                })
+                .await;
+            return;
+        }
+    };
+    let master = Arc::new(std::sync::Mutex::new(pair.master));
+
+    // 当前 PTY 尺寸（CPR 应答使用；resize 时更新）
+    let cols_cell = Arc::new(std::sync::atomic::AtomicU16::new(80));
+    let rows_cell = Arc::new(std::sync::atomic::AtomicU16::new(24));
+
+    // stdin writer 任务（异步）：Data → spawn_blocking 写入 PTY 主端；Resize → 调整尺寸；
+    // stdin 通道关闭或会话结束（tx.closed）→ 退出 → master 释放 → ConPTY 关闭 → 输出泵 EOF
+    let writer_master = Arc::clone(&master);
+    let writer_cols = Arc::clone(&cols_cell);
+    let writer_rows = Arc::clone(&rows_cell);
+    let tx_writer = tx.clone();
+    let _writer_task = tokio::spawn(async move {
+        let writer = writer_master.lock().unwrap().take_writer().ok();
+        let writer = Arc::new(std::sync::Mutex::new(writer));
+        let mut closed = std::pin::pin!(tx_writer.closed());
+        loop {
+            let msg = tokio::select! {
+                m = stdin_rx.recv() => match m {
+                    Some(m) => m,
+                    None => break,
+                },
+                _ = &mut closed => break, // 会话结束（输出事件接收端已 drop）
+            };
+            match msg {
+                StdinMsg::Data(data) => {
+                    let w = Arc::clone(&writer);
+                    let res = tokio::task::spawn_blocking(move || {
+                        if let Some(w) = w.lock().unwrap().as_mut() {
+                            w.write_all(&data).and_then(|_| w.flush())
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .await;
+                    match res {
+                        Ok(Ok(())) => {}
+                        _ => break,
+                    }
+                }
+                StdinMsg::Eof => break,
+                StdinMsg::Resize { cols, rows } => {
+                    writer_cols.store(cols, Ordering::Relaxed);
+                    writer_rows.store(rows, Ordering::Relaxed);
+                    let _ = writer_master
+                        .lock()
+                        .unwrap()
+                        .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
+                }
+            }
+        }
+    });
+
+    // 输出泵：原始字节原样透传（不转码、不截断）；检测 CPR 查询并自动应答
+    // （ConPTY 启动时发送 ESC[6n 并阻塞等待尺寸应答，node-pty 同款处理）
+    let tx_reader = tx.clone();
+    let cpr_tx = stdin_tx;
+    let reader_cols = Arc::clone(&cols_cell);
+    let reader_rows = Arc::clone(&rows_cell);
+    let reader_task = tokio::task::spawn_blocking(move || {
+        use std::io::Read as _;
+        let mut reader = reader;
+        let mut buf = [0u8; 8192];
+        let mut tail: Vec<u8> = Vec::new(); // 跨块检测的尾部缓存
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    tail.extend_from_slice(&buf[..n]);
+                    if tail.windows(4).any(|w| w == b"\x1b[6n") {
+                        let cols = reader_cols.load(Ordering::Relaxed);
+                        let rows = reader_rows.load(Ordering::Relaxed);
+                        let reply = format!("\x1b[{rows};{cols}R");
+                        let _ = cpr_tx.blocking_send(StdinMsg::Data(reply.into_bytes()));
+                    }
+                    let keep_from = tail.len().saturating_sub(3);
+                    tail.drain(..keep_from);
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
+                    if tx_reader
+                        .blocking_send(ExecEvent::Output { stream: "pty", data_b64: b64 })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    // 等待退出；客户端断连（tx.closed）→ kill。PTY 会话无超时。
+    let mut killer = child.clone_killer();
+    let mut wait_task = tokio::task::spawn_blocking(move || child.wait());
+    let mut exit_code: Option<i32> = None;
+    tokio::select! {
+        st = &mut wait_task => {
+            exit_code = st.ok().and_then(|r| r.ok()).map(|s| s.exit_code() as i32);
+        }
+        _ = tx.closed() => {
+            let _ = killer.kill();
+            let _ = tokio::time::timeout(Duration::from_secs(5), &mut wait_task).await;
+        }
+    }
+
+    // 限时排空残余输出（孙进程持有 tty 时可能永不 EOF，超时放弃）
+    let _ = tokio::time::timeout(Duration::from_secs(2), reader_task).await;
+
+    let _ = tx
+        .send(ExecEvent::Exit {
+            exit_code,
+            timeout: false,
+            duration_ms: started.elapsed().as_millis() as u64,
+            truncated: false,
+        })
+        .await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,12 +519,14 @@ mod tests {
             program: "cmd".into(),
             args: ["/C".to_string(), "more".to_string()].to_vec(),
             timeout_secs: Some(15),
+            tty: false,
         };
         #[cfg(not(windows))]
         let req = ExecRequest {
             program: "cat".into(),
             args: vec![],
             timeout_secs: Some(15),
+            tty: false,
         };
 
         let (mut rx, tx) = spawn_exec_stdin(&req);
@@ -358,6 +552,49 @@ mod tests {
         }
         assert!(stdout.contains("hello stdin"), "stdout = {stdout:?}");
         assert_eq!(exit_code, Some(0));
+    }
+
+    /// PTY 会话冒烟：子进程经伪终端执行，输出透传，退出码正确
+    #[tokio::test]
+    async fn pty_session_runs_and_exits() {
+        #[cfg(windows)]
+        let req = ExecRequest {
+            program: "cmd".into(),
+            args: ["/C".to_string(), "echo pty-hello".to_string()].to_vec(),
+            timeout_secs: None,
+            tty: true,
+        };
+        #[cfg(not(windows))]
+        let req = ExecRequest {
+            program: "sh".into(),
+            args: ["-c".to_string(), "echo pty-hello".to_string()].to_vec(),
+            timeout_secs: None,
+            tty: true,
+        };
+
+        let (mut rx, _tx) = spawn_exec_stdin(&req);
+        let mut output = String::new();
+        let mut exit_code = None;
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while let Some(ev) = rx.recv().await {
+                match ev {
+                    ExecEvent::Output { data_b64, .. } => {
+                        output.push_str(&String::from_utf8_lossy(
+                            &base64::engine::general_purpose::STANDARD.decode(&data_b64).unwrap_or_default(),
+                        ));
+                    }
+                    ExecEvent::Exit { exit_code: c, .. } => {
+                        exit_code = c;
+                        break;
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(completed.is_ok(), "PTY 会话未在时限内退出，output = {output:?}");
+        assert_eq!(exit_code, Some(0));
+        // ConPTY 渲染可能把回显内容拆分成屏幕差异片段，放宽为关键字匹配
+        assert!(output.contains("hello"), "pty output = {output:?}");
     }
 
     #[test]

@@ -33,6 +33,9 @@ struct WsInit {
     args: Vec<String>,
     #[serde(default)]
     timeout_secs: Option<u64>,
+    /// 请求 PTY 会话（伪终端 + ANSI 透传，无超时）
+    #[serde(default)]
+    tty: bool,
 }
 
 fn rejected(reason: &str) -> Message {
@@ -83,13 +86,15 @@ async fn session(mut socket: WebSocket, state: Arc<AppState>, client: crate::ser
         return;
     }
 
-    let timeout_secs = init.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS).clamp(1, MAX_TIMEOUT_SECS);
+    // PTY 会话无超时（交互式长连接，断连即终止）
+    let timeout_secs = if init.tty { None } else { Some(init.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS).clamp(1, MAX_TIMEOUT_SECS)) };
     state.audit.log(
         "exec.start",
         &hostname,
         Some(serde_json::json!({
             "program": init.program, "args": init.args,
-            "timeout_secs": timeout_secs, "ip": addr.ip().to_string(),
+            "timeout_secs": timeout_secs, "tty": init.tty,
+            "ip": addr.ip().to_string(),
             "transport": "ws",
         })),
     );
@@ -97,7 +102,8 @@ async fn session(mut socket: WebSocket, state: Arc<AppState>, client: crate::ser
     let (mut rx, stdin_tx) = runner::spawn_exec_stdin(&ExecRequest {
         program: init.program.clone(),
         args: init.args.clone(),
-        timeout_secs: Some(timeout_secs),
+        timeout_secs,
+        tty: init.tty,
     });
 
     if socket.send(Message::Text(serde_json::json!({ "type": "started" }).to_string().into())).await.is_err() {
@@ -147,12 +153,21 @@ async fn session(mut socket: WebSocket, state: Arc<AppState>, client: crate::ser
                 }
             }
             Ok(Message::Text(t)) => {
-                let is_close = serde_json::from_str::<serde_json::Value>(&t)
-                    .ok()
-                    .and_then(|v| v["type"].as_str().map(|s| s == "stdin_close"))
-                    .unwrap_or(false);
-                if is_close {
-                    stdin_tx = None; // drop = EOF
+                let v = serde_json::from_str::<serde_json::Value>(&t).ok();
+                match v.as_ref().and_then(|v| v["type"].as_str()) {
+                    Some("stdin_close") => {
+                        stdin_tx = None; // drop = EOF
+                    }
+                    Some("resize") => {
+                        let cols = v.as_ref().and_then(|v| v["cols"].as_u64()).unwrap_or(0) as u16;
+                        let rows = v.as_ref().and_then(|v| v["rows"].as_u64()).unwrap_or(0) as u16;
+                        if cols > 0 && rows > 0 {
+                            let _ = stdin_tx
+                                .as_ref()
+                                .map(|tx| tx.try_send(StdinMsg::Resize { cols, rows }));
+                        }
+                    }
+                    _ => {}
                 }
             }
             Ok(Message::Close(_)) | Err(_) => break,

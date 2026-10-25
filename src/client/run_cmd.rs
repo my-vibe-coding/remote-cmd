@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use super::config::{load_aliases, render_template, ClientConfig, ServerReg};
-use super::remote::{parse_frame, ws_exec, ExecFrame, ExecWs, STDIN_CLOSE};
+use super::remote::{parse_frame, resize_msg, ws_exec, ExecFrame, ExecWs, STDIN_CLOSE};
 
 /// `remote-cmd run <别名> [args...]`：读取本地配置 → 模板渲染 → WS 会话 → stdin 转发 + 流式输出 → 透传退出码
 pub async fn run(alias: &str, args: &[String], interactive: bool) -> Result<()> {
@@ -15,8 +15,10 @@ pub async fn run(alias: &str, args: &[String], interactive: bool) -> Result<()> 
     let program = body["program"].as_str().unwrap_or_default().to_string();
     let cmd_args: Vec<String> = serde_json::from_value(body["args"].clone())?;
 
-    // 交互模式（REPL 等）默认放宽到最大超时
-    let timeout_secs = if interactive {
+    // 本地 stdin 为终端且 -i → PTY 附加会话（raw mode + resize 同步，无超时）；
+    // 其余保持管道/行模式（非交互走服务端默认超时，交互放宽到最大超时）
+    let pty = interactive && std::io::stdin().is_terminal();
+    let timeout_secs = if !pty && interactive {
         Some(crate::server::runner::MAX_TIMEOUT_SECS)
     } else {
         None
@@ -27,12 +29,17 @@ pub async fn run(alias: &str, args: &[String], interactive: bool) -> Result<()> 
         &program,
         &cmd_args,
         timeout_secs,
+        pty,
     )
     .await
     {
         Ok(w) => w,
         Err(e) => anyhow::bail!("请求服务器失败: {e}"),
     };
+
+    if pty {
+        return run_pty_session(sink, stream).await;
+    }
 
     // stdin 策略：管道 → 转发原始字节；TTY+(-i) → 行模式；TTY 无 -i → 立即 EOF
     let mut stdin_task = None;
@@ -134,6 +141,187 @@ fn spawn_stdin_pump(
         let _ = sink.send(WsMessage::Text(STDIN_CLOSE.into())).await;
         let _ = reader.await;
     })
+}
+
+/// PTY 交互会话：本地终端 raw mode，按键即时转发、resize 同步、ANSI 原样渲染。
+/// Ctrl+] 脱离会话（断开连接，远端子进程被服务端终止）。
+async fn run_pty_session(
+    mut sink: futures::stream::SplitSink<super::remote::WsStream, WsMessage>,
+    mut stream: futures::stream::SplitStream<super::remote::WsStream>,
+) -> Result<()> {
+    use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
+
+    crossterm::terminal::enable_raw_mode().map_err(|e| anyhow!("进入 raw mode 失败: {e}"))?;
+    let _raw = RawModeGuard; // Drop 兜底恢复（显式退出路径已在 exit 前手动关闭）
+
+    // 同步初始终端尺寸（服务端默认 80x24）
+    if let Ok((cols, rows)) = crossterm::terminal::size() {
+        let _ = sink.send(resize_msg(cols, rows)).await;
+    }
+
+    enum InputAction {
+        Data(Vec<u8>),
+        Resize(u16, u16),
+        Detach,
+    }
+
+    // 本地输入线程：阻塞读控制台事件 → 通道
+    let (itx, mut irx) = mpsc::channel::<InputAction>(64);
+    let _input_thread = std::thread::spawn(move || {
+        loop {
+            match crossterm::event::read() {
+                Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => {
+                    if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char(']') {
+                        let _ = itx.blocking_send(InputAction::Detach);
+                        break;
+                    }
+                    if let Some(bytes) = key_to_bytes(k) {
+                        if itx.blocking_send(InputAction::Data(bytes)).is_err() {
+                            break;
+                        }
+                    }
+                }
+                Ok(Event::Resize(cols, rows)) => {
+                    let _ = itx.blocking_send(InputAction::Resize(cols, rows));
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+    });
+
+    // 输入转发任务：本地事件 → WS 帧；Detach 时通知主循环断开
+    let (detach_tx, mut detach_rx) = mpsc::channel::<()>(1);
+    let forward = tokio::spawn(async move {
+        while let Some(a) = irx.recv().await {
+            let msg = match a {
+                InputAction::Data(d) => WsMessage::Binary(d.into()),
+                InputAction::Resize(c, r) => resize_msg(c, r),
+                InputAction::Detach => {
+                    let _ = detach_tx.send(()).await;
+                    break;
+                }
+            };
+            if sink.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // 输出泵：PTY 输出为原始 ANSI 字节，直接写本地终端
+    let mut exit_code: Option<i32> = None;
+    let mut detached = false;
+    loop {
+        tokio::select! {
+            maybe = stream.next() => match maybe {
+                Some(Ok(frame)) => match parse_frame(frame) {
+                    Some(ExecFrame::Output { data, .. }) => {
+                        let mut out = std::io::stdout();
+                        let _ = out.write_all(&data);
+                        let _ = out.flush();
+                    }
+                    Some(ExecFrame::Exit { exit_code: code, .. }) => {
+                        exit_code = code;
+                        break;
+                    }
+                    None => {}
+                },
+                Some(Err(e)) => {
+                    eprintln!("[remote-cmd] 连接中断: {e}");
+                    break;
+                }
+                None => break,
+            },
+            _ = detach_rx.recv() => {
+                detached = true;
+                break;
+            }
+        }
+    }
+
+    forward.abort();
+    let _ = crossterm::terminal::disable_raw_mode();
+    drop(_raw); // 避免 Drop 重复 disable（disable 幂等，仅语义清晰）
+
+    if detached {
+        eprintln!("[remote-cmd] 已脱离会话，远端进程将被终止");
+        std::process::exit(0); // 不经 Drop（已手动恢复终端），立即断开
+    }
+
+    match exit_code {
+        Some(code) => std::process::exit(code),
+        None => {
+            eprintln!("[remote-cmd] 远程命令异常退出");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// raw mode 兜底恢复：正常返回路径经 Drop 关闭；process::exit 路径需在此之前手动 disable
+struct RawModeGuard;
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+/// 按键事件 → 终端字节序列（xterm 风格转义）
+fn key_to_bytes(key: crossterm::event::KeyEvent) -> Option<Vec<u8>> {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Char(c) => {
+            let mut buf = [0u8; 4];
+            let s = c.encode_utf8(&mut buf);
+            let mut out = Vec::new();
+            if alt {
+                out.push(0x1b);
+            }
+            if ctrl {
+                let b = s.as_bytes()[0];
+                if b.is_ascii_alphabetic() || (b'@'..=b'_').contains(&b) {
+                    out.push(b & 0x1f); // Ctrl+字母/@/[/\ ]/^/_ → 控制字符
+                } else {
+                    out.extend_from_slice(s.as_bytes());
+                }
+            } else {
+                out.extend_from_slice(s.as_bytes());
+            }
+            Some(out)
+        }
+        KeyCode::Enter => Some(b"\r".to_vec()),
+        KeyCode::Backspace => Some(vec![0x7f]),
+        KeyCode::Tab => Some(b"\t".to_vec()),
+        KeyCode::BackTab => Some(b"\x1b[Z".to_vec()),
+        KeyCode::Esc => Some(b"\x1b".to_vec()),
+        KeyCode::Left => Some(b"\x1b[D".to_vec()),
+        KeyCode::Right => Some(b"\x1b[C".to_vec()),
+        KeyCode::Up => Some(b"\x1b[A".to_vec()),
+        KeyCode::Down => Some(b"\x1b[B".to_vec()),
+        KeyCode::Home => Some(b"\x1b[H".to_vec()),
+        KeyCode::End => Some(b"\x1b[F".to_vec()),
+        KeyCode::PageUp => Some(b"\x1b[5~".to_vec()),
+        KeyCode::PageDown => Some(b"\x1b[6~".to_vec()),
+        KeyCode::Insert => Some(b"\x1b[2~".to_vec()),
+        KeyCode::Delete => Some(b"\x1b[3~".to_vec()),
+        KeyCode::F(n) => Some(match n {
+            1 => b"\x1bOP".to_vec(),
+            2 => b"\x1bOQ".to_vec(),
+            3 => b"\x1bOR".to_vec(),
+            4 => b"\x1bOS".to_vec(),
+            5 => b"\x1b[15~".to_vec(),
+            6 => b"\x1b[17~".to_vec(),
+            7 => b"\x1b[18~".to_vec(),
+            8 => b"\x1b[19~".to_vec(),
+            9 => b"\x1b[20~".to_vec(),
+            10 => b"\x1b[21~".to_vec(),
+            11 => b"\x1b[23~".to_vec(),
+            12 => b"\x1b[24~".to_vec(),
+            _ => return None,
+        }),
+        _ => None,
+    }
 }
 
 /// 解析别名的执行目标：别名绑定的服务器优先，否则使用默认（第一个已注册）服务器。

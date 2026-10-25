@@ -374,7 +374,7 @@ async fn exec(Json(body): Json<ExecBody>) -> Result<Response, (StatusCode, Strin
     let program = payload["program"].as_str().unwrap_or_default().to_string();
     let args: Vec<String> = serde_json::from_value(payload["args"].clone())
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let mut ws = crate::client::remote::ws_exec(&server.server_url, &token, &program, &args, None)
+    let mut ws = crate::client::remote::ws_exec(&server.server_url, &token, &program, &args, None, false)
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, format!("执行请求失败: {e}")))?;
 
