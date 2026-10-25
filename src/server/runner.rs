@@ -358,6 +358,79 @@ fn respond_csi_query(
     }
 }
 
+/// OSC 查询自动应答：seq 为完整的 ESC]...payload(BEL|ESC\) 序列。
+/// vim 等全屏程序会查询背景色（OSC 11）、前景色（OSC 10）、调色板（OSC 4），
+/// 不应答会让本地终端抢答并把应答变成垃圾输入。
+fn respond_osc_query(seq: &[u8], tx: &mpsc::Sender<StdinMsg>) {
+    if seq.len() < 4 || seq[0] != 0x1b || seq[1] != b']' {
+        return;
+    }
+    let mut end = seq.len();
+    if seq[end - 1] == 0x07 {
+        end -= 1; // BEL 终止
+    } else if seq[end - 1] == b'\\' && end >= 3 && seq[end - 2] == 0x1b {
+        end -= 2; // ST 终止
+    } else {
+        return;
+    }
+    let payload = std::str::from_utf8(&seq[2..end]).ok().unwrap_or("");
+    let parts: Vec<&str> = payload.split(';').collect();
+    let reply = match parts.first() {
+        Some(&"11") if parts.get(1) == Some(&"?") => {
+            // 背景色（深色主题默认值，与 Windows Terminal 默认一致）
+            Some("\x1b]11;rgb:0c0c/0c0c/0c0c\x1b\\".to_string())
+        }
+        Some(&"10") if parts.get(1) == Some(&"?") => {
+            Some("\x1b]10;rgb:cccccc/cccccc/cccccc\x1b\\".to_string())
+        }
+        Some(&"4") => {
+            // 调色板查询：4;idx;?[;idx;?...]
+            let mut pairs: Vec<String> = Vec::new();
+            let mut i = 1;
+            while i + 1 < parts.len() {
+                if parts[i + 1] == "?" {
+                    if let Some(rgb) = parts[i].parse::<usize>().ok().and_then(palette_rgb) {
+                        pairs.push(format!("{};{}", parts[i], rgb));
+                    }
+                }
+                i += 2;
+            }
+            if pairs.is_empty() {
+                None
+            } else {
+                Some(format!("\x1b]4;{}\x1b\\", pairs.join(";")))
+            }
+        }
+        _ => None,
+    };
+    if let Some(r) = reply {
+        let _ = tx.blocking_send(StdinMsg::Data(r.into_bytes()));
+    }
+}
+
+/// xterm 256 色调色板 → "rgb:RRRR/GGGG/BBBB"；越界返回 None
+fn palette_rgb(idx: usize) -> Option<String> {
+    let (r, g, b) = if idx < 16 {
+        const BASE16: [(u8, u8, u8); 16] = [
+            (0x00, 0x00, 0x00), (0x80, 0x00, 0x00), (0x00, 0x80, 0x00), (0x80, 0x80, 0x00),
+            (0x00, 0x00, 0x80), (0x80, 0x00, 0x80), (0x00, 0x80, 0x80), (0xc0, 0xc0, 0xc0),
+            (0x80, 0x80, 0x80), (0xff, 0x00, 0x00), (0x00, 0xff, 0x00), (0xff, 0xff, 0x00),
+            (0x00, 0x00, 0xff), (0xff, 0x00, 0xff), (0x00, 0xff, 0xff), (0xff, 0xff, 0xff),
+        ];
+        BASE16[idx]
+    } else if idx < 232 {
+        let n = idx - 16;
+        let lv = [0u8, 95, 135, 175, 215, 255];
+        (lv[n / 36], lv[(n % 36) / 6], lv[n % 6])
+    } else if idx <= 255 {
+        let v = 8 + 10 * (idx - 232) as u8;
+        (v, v, v)
+    } else {
+        return None;
+    };
+    Some(format!("rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}"))
+}
+
 /// PTY 会话：伪终端 + ANSI 原样透传（Windows ConPTY / Unix openpty）。
 /// 无 stdout/stderr 区分（stream="pty"）、无输出截断、无超时；客户端断连时 kill 子进程。
 /// stdin_tx 供 CPR 自动应答使用（ConPTY 启动时发送 ESC[6n 并阻塞等待应答，node-pty 同款处理）。
@@ -489,32 +562,38 @@ async fn run_pty(
         use std::io::Read as _;
         let mut reader = reader;
         let mut buf = [0u8; 8192];
-        let mut csi: Vec<u8> = Vec::new(); // 跨块收集的 CSI 序列
+        let mut seq: Vec<u8> = Vec::new(); // 跨块收集的 CSI/OSC 序列
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     for &b in &buf[..n] {
-                        if csi.is_empty() {
+                        if seq.is_empty() {
                             if b == 0x1b {
-                                csi.push(b);
+                                seq.push(b);
                             }
-                        } else if csi.len() == 1 {
-                            if b == b'[' {
-                                csi.push(b);
-                            } else {
-                                csi.clear();
-                                if b == 0x1b {
-                                    csi.push(b);
-                                }
+                        } else if seq.len() == 1 {
+                            match b {
+                                b'[' | b']' => seq.push(b), // CSI / OSC
+                                0x1b => {}                  // 连续 ESC，维持状态
+                                _ => seq.clear(),
+                            }
+                        } else if seq[1] == b'[' {
+                            seq.push(b);
+                            if (0x40..=0x7e).contains(&b) {
+                                respond_csi_query(&seq, &cpr_tx, &reader_cols, &reader_rows);
+                                seq.clear();
+                            } else if seq.len() >= 32 {
+                                seq.clear(); // 异常序列，放弃
                             }
                         } else {
-                            csi.push(b);
-                            if (0x40..=0x7e).contains(&b) {
-                                respond_csi_query(&csi, &cpr_tx, &reader_cols, &reader_rows);
-                                csi.clear();
-                            } else if csi.len() >= 32 {
-                                csi.clear(); // 异常序列，放弃
+                            // OSC：等待 BEL 或 ST（ESC \）终止
+                            seq.push(b);
+                            if b == 0x07 || (b == b'\\' && seq.len() >= 2 && seq[seq.len() - 2] == 0x1b) {
+                                respond_osc_query(&seq, &cpr_tx);
+                                seq.clear();
+                            } else if seq.len() >= 128 {
+                                seq.clear();
                             }
                         }
                     }

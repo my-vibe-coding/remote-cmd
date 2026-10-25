@@ -257,7 +257,7 @@ impl Drop for RawModeGuard {
 /// 查询由服务端自动应答，本地不应答——否则本地应答经按键转发回远端会成为垃圾输入
 /// （vim 中显示 [3;1R 之类片段）。支持查询序列跨块到达。
 struct QueryFilter {
-    csi: Vec<u8>, // 收集中的 CSI 序列（跨块）
+    seq: Vec<u8>, // 收集中的 CSI/OSC 序列（跨块）
 }
 
 impl QueryFilter {
@@ -265,44 +265,52 @@ impl QueryFilter {
     const QUERY_FINALS: [u8; 4] = [b'c', b'n', b'q', b'u'];
 
     fn new() -> Self {
-        QueryFilter { csi: Vec::new() }
+        QueryFilter { seq: Vec::new() }
     }
 
     fn feed(&mut self, data: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(data.len() + self.csi.len());
+        let mut out = Vec::with_capacity(data.len() + self.seq.len());
         for &b in data {
-            if self.csi.is_empty() {
+            if self.seq.is_empty() {
                 if b == 0x1b {
-                    self.csi.push(b);
+                    self.seq.push(b);
                 } else {
                     out.push(b);
                 }
-            } else if self.csi.len() == 1 {
-                if b == b'[' {
-                    self.csi.push(b);
-                } else {
-                    // 非 CSI 的 ESC 序列，原样放行
-                    out.extend_from_slice(&self.csi);
-                    self.csi.clear();
-                    if b == 0x1b {
-                        self.csi.push(b);
-                    } else {
+            } else if self.seq.len() == 1 {
+                match b {
+                    b'[' | b']' => self.seq.push(b), // CSI / OSC
+                    0x1b => {}
+                    _ => {
+                        // 非 CSI/OSC 的 ESC 序列，原样放行
+                        out.extend_from_slice(&self.seq);
+                        self.seq.clear();
                         out.push(b);
                     }
                 }
-            } else {
-                self.csi.push(b);
+            } else if self.seq[1] == b'[' {
+                self.seq.push(b);
                 if (0x40..=0x7e).contains(&b) {
-                    if Self::QUERY_FINALS.contains(&b) {
-                        // 查询序列：丢弃
-                    } else {
-                        out.extend_from_slice(&self.csi);
+                    if !Self::QUERY_FINALS.contains(&b) {
+                        out.extend_from_slice(&self.seq);
                     }
-                    self.csi.clear();
-                } else if self.csi.len() >= 32 {
+                    self.seq.clear();
+                } else if self.seq.len() >= 32 {
                     // 异常序列，原样放行避免吞输出
-                    out.extend_from_slice(&self.csi);
-                    self.csi.clear();
+                    out.extend_from_slice(&self.seq);
+                    self.seq.clear();
+                }
+            } else {
+                // OSC：等待 BEL 或 ST（ESC \）终止；含 ? 的为查询，丢弃
+                self.seq.push(b);
+                if b == 0x07 || (b == b'\\' && self.seq.len() >= 2 && self.seq[self.seq.len() - 2] == 0x1b) {
+                    if !self.seq[2..].contains(&b'?') {
+                        out.extend_from_slice(&self.seq);
+                    }
+                    self.seq.clear();
+                } else if self.seq.len() >= 128 {
+                    out.extend_from_slice(&self.seq);
+                    self.seq.clear();
                 }
             }
         }
@@ -310,7 +318,7 @@ impl QueryFilter {
     }
 
     fn flush(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.csi)
+        std::mem::take(&mut self.seq)
     }
 }
 
