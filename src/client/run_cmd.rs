@@ -252,46 +252,65 @@ impl Drop for RawModeGuard {
     }
 }
 
-/// 终端查询序列过滤器：从 PTY 输出流中移除会触发本地终端自动应答的查询。
-/// CPR（DSR 光标位置）与 DA（设备属性）查询由服务端应答，本地不应答，
-/// 否则本地应答经按键转发回远端会成为垃圾输入。
-/// 支持查询序列跨块到达（保留尾部前缀等待下一块）。
+/// 终端查询序列过滤器：从 PTY 输出流中移除会触发本地终端自动应答的 CSI 查询
+/// （final 字节为 c=DA / n=DSR / q=XTVERSION / u=kitty键盘协议查询）。
+/// 查询由服务端自动应答，本地不应答——否则本地应答经按键转发回远端会成为垃圾输入
+/// （vim 中显示 [3;1R 之类片段）。支持查询序列跨块到达。
 struct QueryFilter {
-    tail: Vec<u8>,
+    csi: Vec<u8>, // 收集中的 CSI 序列（跨块）
 }
 
 impl QueryFilter {
-    /// 需要过滤的查询序列（本地终端会应答的）
-    const PATTERNS: [&'static [u8]; 4] = [b"\x1b[6n", b"\x1b[?6n", b"\x1b[c", b"\x1b[>c"];
+    /// 查询类 final 字节：这些 CSI 只作为"询问"出现，输出流中不应放行
+    const QUERY_FINALS: [u8; 4] = [b'c', b'n', b'q', b'u'];
 
     fn new() -> Self {
-        QueryFilter { tail: Vec::new() }
+        QueryFilter { csi: Vec::new() }
     }
 
     fn feed(&mut self, data: &[u8]) -> Vec<u8> {
-        let mut buf = std::mem::take(&mut self.tail);
-        buf.extend_from_slice(data);
-        let mut out = Vec::with_capacity(buf.len());
-        let mut i = 0;
-        while i < buf.len() {
-            let rest = &buf[i..];
-            let matched = Self::PATTERNS.iter().find(|p| rest.starts_with(**p)).map(|p| p.len());
-            if let Some(len) = matched {
-                i += len;
-            } else if Self::PATTERNS.iter().any(|p| p.starts_with(rest)) {
-                // rest 是某查询序列的真前缀 → 保留等待下一块
-                break;
+        let mut out = Vec::with_capacity(data.len() + self.csi.len());
+        for &b in data {
+            if self.csi.is_empty() {
+                if b == 0x1b {
+                    self.csi.push(b);
+                } else {
+                    out.push(b);
+                }
+            } else if self.csi.len() == 1 {
+                if b == b'[' {
+                    self.csi.push(b);
+                } else {
+                    // 非 CSI 的 ESC 序列，原样放行
+                    out.extend_from_slice(&self.csi);
+                    self.csi.clear();
+                    if b == 0x1b {
+                        self.csi.push(b);
+                    } else {
+                        out.push(b);
+                    }
+                }
             } else {
-                out.push(buf[i]);
-                i += 1;
+                self.csi.push(b);
+                if (0x40..=0x7e).contains(&b) {
+                    if Self::QUERY_FINALS.contains(&b) {
+                        // 查询序列：丢弃
+                    } else {
+                        out.extend_from_slice(&self.csi);
+                    }
+                    self.csi.clear();
+                } else if self.csi.len() >= 32 {
+                    // 异常序列，原样放行避免吞输出
+                    out.extend_from_slice(&self.csi);
+                    self.csi.clear();
+                }
             }
         }
-        self.tail = buf[i..].to_vec();
         out
     }
 
     fn flush(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.tail)
+        std::mem::take(&mut self.csi)
     }
 }
 

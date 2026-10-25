@@ -327,6 +327,37 @@ pub fn whitelist_matches(whitelist: &[String], program: &str) -> bool {
     whitelist.iter().any(|entry| entry.trim().to_lowercase() == name)
 }
 
+/// CSI 查询自动应答：seq 为完整的 ESC[...final 序列。
+/// 仅应答查询类序列（DSR/CPR/DA/DECXCPR），其余忽略；输出仍原样转发给客户端。
+fn respond_csi_query(
+    seq: &[u8],
+    tx: &mpsc::Sender<StdinMsg>,
+    cols: &std::sync::atomic::AtomicU16,
+    rows: &std::sync::atomic::AtomicU16,
+) {
+    use std::sync::atomic::Ordering;
+    if seq.len() < 3 || &seq[..2] != b"\x1b[" {
+        return;
+    }
+    let final_b = seq[seq.len() - 1];
+    let body = &seq[2..seq.len() - 1];
+    let (c, r) = (cols.load(Ordering::Relaxed), rows.load(Ordering::Relaxed));
+    let reply: Option<Vec<u8>> = match (final_b, body) {
+        // CPR：光标位置查询
+        (b'n', b"6") => Some(format!("\x1b[{r};{c}R").into_bytes()),
+        // DECXCPR：扩展光标位置查询
+        (b'n', b"?6") => Some(format!("\x1b[?{r};{c};1R").into_bytes()),
+        // DA1：主设备属性（VT102）
+        (b'c', b"") => Some(b"\x1b[?6c".to_vec()),
+        // DA2：次设备属性（xterm 风格）
+        (b'c', b">") => Some(b"\x1b[>41;330;0c".to_vec()),
+        _ => None,
+    };
+    if let Some(r) = reply {
+        let _ = tx.blocking_send(StdinMsg::Data(r));
+    }
+}
+
 /// PTY 会话：伪终端 + ANSI 原样透传（Windows ConPTY / Unix openpty）。
 /// 无 stdout/stderr 区分（stream="pty"）、无输出截断、无超时；客户端断连时 kill 子进程。
 /// stdin_tx 供 CPR 自动应答使用（ConPTY 启动时发送 ESC[6n 并阻塞等待应答，node-pty 同款处理）。
@@ -358,6 +389,9 @@ async fn run_pty(
 
     let mut cmd = CommandBuilder::new(&req.program);
     cmd.args(&req.args);
+    // 终端类型：Windows 子进程不使用；嵌套场景（docker exec 等）会转发给容器内程序，
+    // 缺失会导致容器内 vim 等全屏程序无法初始化
+    cmd.env("TERM", "xterm-256color");
     let mut child = match pair.slave.spawn_command(cmd) {
         Ok(c) => c,
         Err(err) => {
@@ -444,8 +478,9 @@ async fn run_pty(
         }
     });
 
-    // 输出泵：原始字节原样透传（不转码、不截断）；检测 CPR 查询并自动应答
-    // （ConPTY 启动时发送 ESC[6n 并阻塞等待尺寸应答，node-pty 同款处理）
+    // 输出泵：原始字节原样透传（不转码、不截断）；嗅探 CSI 查询并自动应答。
+    // ConPTY 会把应用（含 docker exec 内层终端）的终端查询转发给真正的终端（即本进程），
+    // 不应答会导致 vim 等全屏程序阻塞在启动握手（node-pty/真实终端同款处理）。
     let tx_reader = tx.clone();
     let cpr_tx = stdin_tx;
     let reader_cols = Arc::clone(&cols_cell);
@@ -454,20 +489,35 @@ async fn run_pty(
         use std::io::Read as _;
         let mut reader = reader;
         let mut buf = [0u8; 8192];
-        let mut tail: Vec<u8> = Vec::new(); // 跨块检测的尾部缓存
+        let mut csi: Vec<u8> = Vec::new(); // 跨块收集的 CSI 序列
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    tail.extend_from_slice(&buf[..n]);
-                    if tail.windows(4).any(|w| w == b"\x1b[6n") {
-                        let cols = reader_cols.load(Ordering::Relaxed);
-                        let rows = reader_rows.load(Ordering::Relaxed);
-                        let reply = format!("\x1b[{rows};{cols}R");
-                        let _ = cpr_tx.blocking_send(StdinMsg::Data(reply.into_bytes()));
+                    for &b in &buf[..n] {
+                        if csi.is_empty() {
+                            if b == 0x1b {
+                                csi.push(b);
+                            }
+                        } else if csi.len() == 1 {
+                            if b == b'[' {
+                                csi.push(b);
+                            } else {
+                                csi.clear();
+                                if b == 0x1b {
+                                    csi.push(b);
+                                }
+                            }
+                        } else {
+                            csi.push(b);
+                            if (0x40..=0x7e).contains(&b) {
+                                respond_csi_query(&csi, &cpr_tx, &reader_cols, &reader_rows);
+                                csi.clear();
+                            } else if csi.len() >= 32 {
+                                csi.clear(); // 异常序列，放弃
+                            }
+                        }
                     }
-                    let keep_from = tail.len().saturating_sub(3);
-                    tail.drain(..keep_from);
                     let b64 = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
                     if tx_reader
                         .blocking_send(ExecEvent::Output { stream: "pty", data_b64: b64 })
