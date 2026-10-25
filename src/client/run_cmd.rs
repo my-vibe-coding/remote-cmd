@@ -18,6 +18,8 @@ pub async fn run(alias: &str, args: &[String]) -> Result<()> {
     // 本地 stdin 为终端 → PTY 附加会话（raw mode + resize 同步，无超时）；
     // 管道 stdin → 字节流转发 + 流式输出（服务端默认超时）
     let pty = std::io::stdin().is_terminal();
+    // PTY 会话：本地尺寸随 init 帧上报（服务端按此创建 PTY，避免 80x24 初始竞态）
+    let tty_size = if pty { crossterm::terminal::size().ok() } else { None };
     let ExecWs { sink, stream } = match ws_exec(
         &server.server_url,
         server.token.as_deref().unwrap_or_default(),
@@ -25,6 +27,7 @@ pub async fn run(alias: &str, args: &[String]) -> Result<()> {
         &cmd_args,
         None,
         pty,
+        tty_size,
     )
     .await
     {
@@ -126,11 +129,6 @@ async fn run_pty_session(
     crossterm::terminal::enable_raw_mode().map_err(|e| anyhow!("进入 raw mode 失败: {e}"))?;
     let _raw = RawModeGuard; // Drop 兜底恢复（显式退出路径已在 exit 前手动关闭）
 
-    // 同步初始终端尺寸（服务端默认 80x24）
-    if let Ok((cols, rows)) = crossterm::terminal::size() {
-        let _ = sink.send(resize_msg(cols, rows)).await;
-    }
-
     enum InputAction {
         Data(Vec<u8>),
         Resize(u16, u16),
@@ -180,11 +178,9 @@ async fn run_pty_session(
         }
     });
 
-    // 输出泵：PTY 输出为原始 ANSI 字节，直接写本地终端；
-    // 过滤终端查询序列（CPR/DA）：本地终端会自动应答并注入输入缓冲，
-    // 经 crossterm 拆成按键事件转发后会污染远端输入（vim 显示 [3;1R 等）。
-    // 查询由服务端 CPR 自动应答处理，本地不应答。
-    let mut query_filter = QueryFilter::new();
+    // 输出泵：PTY 输出为原始 ANSI 字节，直接写本地终端（不做任何过滤）。
+    // 终端查询（CPR/DA/OSC）透传给本地终端应答——本地终端知道真实光标位置/颜色，
+    // 应答经本地输入→按键转发原样回到远端（与 WT+ssh 链路等价）。
     let mut exit_code: Option<i32> = None;
     let mut detached = false;
     loop {
@@ -192,12 +188,9 @@ async fn run_pty_session(
             maybe = stream.next() => match maybe {
                 Some(Ok(frame)) => match parse_frame(frame) {
                     Some(ExecFrame::Output { data, .. }) => {
-                        let filtered = query_filter.feed(&data);
-                        if !filtered.is_empty() {
-                            let mut out = std::io::stdout();
-                            let _ = out.write_all(&filtered);
-                            let _ = out.flush();
-                        }
+                        let mut out = std::io::stdout();
+                        let _ = out.write_all(&data);
+                        let _ = out.flush();
                     }
                     Some(ExecFrame::Exit { exit_code: code, .. }) => {
                         exit_code = code;
@@ -216,14 +209,6 @@ async fn run_pty_session(
                 break;
             }
         }
-    }
-
-    // 冲刷过滤器尾部（未完成的转义序列按原样输出）
-    let tail = query_filter.flush();
-    if !tail.is_empty() {
-        let mut out = std::io::stdout();
-        let _ = out.write_all(&tail);
-        let _ = out.flush();
     }
 
     forward.abort();
@@ -249,76 +234,6 @@ struct RawModeGuard;
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let _ = crossterm::terminal::disable_raw_mode();
-    }
-}
-
-/// 终端查询序列过滤器：从 PTY 输出流中移除会触发本地终端自动应答的 CSI 查询
-/// （final 字节为 c=DA / n=DSR / q=XTVERSION / u=kitty键盘协议查询）。
-/// 查询由服务端自动应答，本地不应答——否则本地应答经按键转发回远端会成为垃圾输入
-/// （vim 中显示 [3;1R 之类片段）。支持查询序列跨块到达。
-struct QueryFilter {
-    seq: Vec<u8>, // 收集中的 CSI/OSC 序列（跨块）
-}
-
-impl QueryFilter {
-    /// 查询类 final 字节：这些 CSI 只作为"询问"出现，输出流中不应放行
-    const QUERY_FINALS: [u8; 4] = [b'c', b'n', b'q', b'u'];
-
-    fn new() -> Self {
-        QueryFilter { seq: Vec::new() }
-    }
-
-    fn feed(&mut self, data: &[u8]) -> Vec<u8> {
-        let mut out = Vec::with_capacity(data.len() + self.seq.len());
-        for &b in data {
-            if self.seq.is_empty() {
-                if b == 0x1b {
-                    self.seq.push(b);
-                } else {
-                    out.push(b);
-                }
-            } else if self.seq.len() == 1 {
-                match b {
-                    b'[' | b']' => self.seq.push(b), // CSI / OSC
-                    0x1b => {}
-                    _ => {
-                        // 非 CSI/OSC 的 ESC 序列，原样放行
-                        out.extend_from_slice(&self.seq);
-                        self.seq.clear();
-                        out.push(b);
-                    }
-                }
-            } else if self.seq[1] == b'[' {
-                self.seq.push(b);
-                if (0x40..=0x7e).contains(&b) {
-                    if !Self::QUERY_FINALS.contains(&b) {
-                        out.extend_from_slice(&self.seq);
-                    }
-                    self.seq.clear();
-                } else if self.seq.len() >= 32 {
-                    // 异常序列，原样放行避免吞输出
-                    out.extend_from_slice(&self.seq);
-                    self.seq.clear();
-                }
-            } else {
-                // OSC：等待 BEL 或 ST（ESC \）终止；含 ? 的为查询，丢弃
-                self.seq.push(b);
-                if b == 0x07 || (b == b'\\' && self.seq.len() >= 2 && self.seq[self.seq.len() - 2] == 0x1b) {
-                    if !self.seq[2..].contains(&b'?') {
-                        out.extend_from_slice(&self.seq);
-                    }
-                    self.seq.clear();
-                } else if self.seq.len() >= 128 {
-                    out.extend_from_slice(&self.seq);
-                    self.seq.clear();
-                }
-            }
-        }
-        out
-    }
-
-    fn flush(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.seq)
     }
 }
 

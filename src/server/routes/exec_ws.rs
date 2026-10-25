@@ -36,6 +36,11 @@ struct WsInit {
     /// 请求 PTY 会话（伪终端 + ANSI 透传，无超时）
     #[serde(default)]
     tty: bool,
+    /// 客户端本地终端尺寸（PTY 会话初始尺寸，避免 80x24 初始竞态）
+    #[serde(default)]
+    cols: Option<u16>,
+    #[serde(default)]
+    rows: Option<u16>,
 }
 
 fn rejected(reason: &str) -> Message {
@@ -99,12 +104,19 @@ async fn session(mut socket: WebSocket, state: Arc<AppState>, client: crate::ser
         })),
     );
 
-    let (mut rx, stdin_tx) = runner::spawn_exec_stdin(&ExecRequest {
-        program: init.program.clone(),
-        args: init.args.clone(),
-        timeout_secs,
-        tty: init.tty,
-    });
+    let tty_size = match (init.cols, init.rows) {
+        (Some(c), Some(r)) if c > 0 && r > 0 && c <= 1024 && r <= 1024 => Some((c, r)),
+        _ => None,
+    };
+    let (mut rx, stdin_tx) = runner::spawn_exec_stdin(
+        &ExecRequest {
+            program: init.program.clone(),
+            args: init.args.clone(),
+            timeout_secs,
+            tty: init.tty,
+        },
+        tty_size,
+    );
 
     if socket.send(Message::Text(serde_json::json!({ "type": "started" }).to_string().into())).await.is_err() {
         return; // rx 随函数返回被 drop → 子进程被 kill

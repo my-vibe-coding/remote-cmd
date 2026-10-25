@@ -105,6 +105,7 @@ fn tls_connector() -> Connector {
 }
 
 /// 建立执行 WS 会话：连接 → 认证 → init 握手（等待 started / rejected）
+/// tty_size：PTY 会话的本地终端尺寸（cols, rows），随 init 帧上报避免服务端 80x24 初始竞态
 pub async fn ws_exec(
     server_url: &str,
     token: &str,
@@ -112,6 +113,7 @@ pub async fn ws_exec(
     args: &[String],
     timeout_secs: Option<u64>,
     tty: bool,
+    tty_size: Option<(u16, u16)>,
 ) -> Result<ExecWs> {
     let url = server_url
         .replacen("https://", "wss://", 1)
@@ -124,12 +126,15 @@ pub async fn ws_exec(
     let (ws, _) = connect_async_tls_with_config(request, None, false, Some(tls_connector())).await?;
     let (mut sink, mut stream) = ws.split();
 
+    let (cols, rows) = tty_size.unwrap_or((0, 0));
     let init = serde_json::json!({
         "type": "init",
         "program": program,
         "args": args,
         "timeout_secs": timeout_secs,
         "tty": tty,
+        "cols": cols,
+        "rows": rows,
     });
     sink.send(WsMessage::Text(init.to_string().into())).await?;
 

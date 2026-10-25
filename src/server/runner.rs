@@ -51,8 +51,12 @@ pub enum StdinMsg {
 }
 
 /// 启动子进程（stdin 已接管）：返回 (输出事件流, stdin 发送端)。
+/// tty_size 为 PTY 初始尺寸（PTY 会话由客户端随 init 帧上报本地终端尺寸，避免 80x24 初始竞态）。
 /// Sender drop 与发送 Eof 等价（关闭子进程 stdin）；输出 Receiver 被 drop（客户端断连）时子进程被 kill。
-pub fn spawn_exec_stdin(req: &ExecRequest) -> (mpsc::Receiver<ExecEvent>, mpsc::Sender<StdinMsg>) {
+pub fn spawn_exec_stdin(
+    req: &ExecRequest,
+    tty_size: Option<(u16, u16)>,
+) -> (mpsc::Receiver<ExecEvent>, mpsc::Sender<StdinMsg>) {
     let (tx, rx) = mpsc::channel::<ExecEvent>(256);
     let (stx, srx) = mpsc::channel::<StdinMsg>(32);
     let req = ExecRequest {
@@ -64,7 +68,7 @@ pub fn spawn_exec_stdin(req: &ExecRequest) -> (mpsc::Receiver<ExecEvent>, mpsc::
     let stx_pty = stx.clone();
     tokio::spawn(async move {
         if req.tty {
-            run_pty(req, tx, stx_pty, srx).await;
+            run_pty(req, tx, stx_pty, srx, tty_size).await;
         } else {
             run(req, tx, srx).await;
         }
@@ -327,124 +331,56 @@ pub fn whitelist_matches(whitelist: &[String], program: &str) -> bool {
     whitelist.iter().any(|entry| entry.trim().to_lowercase() == name)
 }
 
-/// CSI 查询自动应答：seq 为完整的 ESC[...final 序列。
-/// 仅应答查询类序列（DSR/CPR/DA/DECXCPR），其余忽略；输出仍原样转发给客户端。
-fn respond_csi_query(
-    seq: &[u8],
-    tx: &mpsc::Sender<StdinMsg>,
-    cols: &std::sync::atomic::AtomicU16,
-    rows: &std::sync::atomic::AtomicU16,
-) {
-    use std::sync::atomic::Ordering;
-    if seq.len() < 3 || &seq[..2] != b"\x1b[" {
+/// CPR 兜底应答：seq 为完整的 ESC[...final 序列时，若为 6n 查询则安排 1.5s 后兜底应答
+/// （正常情况由客户端本地终端真实应答并经 stdin 中继返回；兜底仅在中继失效时触发，防止 ConPTY 启动握手卡死）。
+fn maybe_cpr_fallback(seq: &[u8], tx: &mpsc::Sender<StdinMsg>, answered: &Arc<AtomicBool>) {
+    if seq != b"\x1b[6n" {
         return;
     }
-    let final_b = seq[seq.len() - 1];
-    let body = &seq[2..seq.len() - 1];
-    let (c, r) = (cols.load(Ordering::Relaxed), rows.load(Ordering::Relaxed));
-    let reply: Option<Vec<u8>> = match (final_b, body) {
-        // CPR：光标位置查询
-        (b'n', b"6") => Some(format!("\x1b[{r};{c}R").into_bytes()),
-        // DECXCPR：扩展光标位置查询
-        (b'n', b"?6") => Some(format!("\x1b[?{r};{c};1R").into_bytes()),
-        // DA1：主设备属性（VT102）
-        (b'c', b"") => Some(b"\x1b[?6c".to_vec()),
-        // DA2：次设备属性（xterm 风格）
-        (b'c', b">") => Some(b"\x1b[>41;330;0c".to_vec()),
-        _ => None,
-    };
-    if let Some(r) = reply {
-        let _ = tx.blocking_send(StdinMsg::Data(r));
-    }
+    let tx = tx.clone();
+    let answered = Arc::clone(answered);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        // 中继应答（任何 CPR 样式数据）会置位 answered；未置位才兜底
+        if !answered.swap(true, Ordering::Relaxed) {
+            let _ = tx.blocking_send(StdinMsg::Data(b"\x1b[1;1R".to_vec()));
+        }
+    });
 }
 
-/// OSC 查询自动应答：seq 为完整的 ESC]...payload(BEL|ESC\) 序列。
-/// vim 等全屏程序会查询背景色（OSC 11）、前景色（OSC 10）、调色板（OSC 4），
-/// 不应答会让本地终端抢答并把应答变成垃圾输入。
-fn respond_osc_query(seq: &[u8], tx: &mpsc::Sender<StdinMsg>) {
-    if seq.len() < 4 || seq[0] != 0x1b || seq[1] != b']' {
-        return;
-    }
-    let mut end = seq.len();
-    if seq[end - 1] == 0x07 {
-        end -= 1; // BEL 终止
-    } else if seq[end - 1] == b'\\' && end >= 3 && seq[end - 2] == 0x1b {
-        end -= 2; // ST 终止
-    } else {
-        return;
-    }
-    let payload = std::str::from_utf8(&seq[2..end]).ok().unwrap_or("");
-    let parts: Vec<&str> = payload.split(';').collect();
-    let reply = match parts.first() {
-        Some(&"11") if parts.get(1) == Some(&"?") => {
-            // 背景色（深色主题默认值，与 Windows Terminal 默认一致）
-            Some("\x1b]11;rgb:0c0c/0c0c/0c0c\x1b\\".to_string())
-        }
-        Some(&"10") if parts.get(1) == Some(&"?") => {
-            Some("\x1b]10;rgb:cccccc/cccccc/cccccc\x1b\\".to_string())
-        }
-        Some(&"4") => {
-            // 调色板查询：4;idx;?[;idx;?...]
-            let mut pairs: Vec<String> = Vec::new();
-            let mut i = 1;
-            while i + 1 < parts.len() {
-                if parts[i + 1] == "?" {
-                    if let Some(rgb) = parts[i].parse::<usize>().ok().and_then(palette_rgb) {
-                        pairs.push(format!("{};{}", parts[i], rgb));
-                    }
-                }
-                i += 2;
-            }
-            if pairs.is_empty() {
-                None
-            } else {
-                Some(format!("\x1b]4;{}\x1b\\", pairs.join(";")))
-            }
-        }
-        _ => None,
-    };
-    if let Some(r) = reply {
-        let _ = tx.blocking_send(StdinMsg::Data(r.into_bytes()));
-    }
-}
-
-/// xterm 256 色调色板 → "rgb:RRRR/GGGG/BBBB"；越界返回 None
-fn palette_rgb(idx: usize) -> Option<String> {
-    let (r, g, b) = if idx < 16 {
-        const BASE16: [(u8, u8, u8); 16] = [
-            (0x00, 0x00, 0x00), (0x80, 0x00, 0x00), (0x00, 0x80, 0x00), (0x80, 0x80, 0x00),
-            (0x00, 0x00, 0x80), (0x80, 0x00, 0x80), (0x00, 0x80, 0x80), (0xc0, 0xc0, 0xc0),
-            (0x80, 0x80, 0x80), (0xff, 0x00, 0x00), (0x00, 0xff, 0x00), (0xff, 0xff, 0x00),
-            (0x00, 0x00, 0xff), (0xff, 0x00, 0xff), (0x00, 0xff, 0xff), (0xff, 0xff, 0xff),
-        ];
-        BASE16[idx]
-    } else if idx < 232 {
-        let n = idx - 16;
-        let lv = [0u8, 95, 135, 175, 215, 255];
-        (lv[n / 36], lv[(n % 36) / 6], lv[n % 6])
-    } else if idx <= 255 {
-        let v = 8 + 10 * (idx - 232) as u8;
-        (v, v, v)
-    } else {
-        return None;
-    };
-    Some(format!("rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}"))
+/// CPR 样式应答识别（用于置位兜底开关）：ESC[ + 数字/;/? + R
+fn is_cpr_reply(data: &[u8]) -> bool {
+    data.len() >= 4
+        && data[0] == 0x1b
+        && data[1] == b'['
+        && data[data.len() - 1] == b'R'
+        && data[2..data.len() - 1]
+            .iter()
+            .all(|b| b.is_ascii_digit() || *b == b';' || *b == b'?')
 }
 
 /// PTY 会话：伪终端 + ANSI 原样透传（Windows ConPTY / Unix openpty）。
 /// 无 stdout/stderr 区分（stream="pty"）、无输出截断、无超时；客户端断连时 kill 子进程。
-/// stdin_tx 供 CPR 自动应答使用（ConPTY 启动时发送 ESC[6n 并阻塞等待应答，node-pty 同款处理）。
+/// 终端查询（CPR/DA/OSC）透传给客户端的本地终端应答，经按键流原样回到本端（与 WT+ssh 链路等价）；
+/// 仅 CPR 保持 1.5s 兜底应答（ConPTY 启动握手会阻塞等待 ESC[6n 应答，若中继失效则会话卡死）。
 async fn run_pty(
     req: ExecRequest,
     tx: mpsc::Sender<ExecEvent>,
     stdin_tx: mpsc::Sender<StdinMsg>,
     mut stdin_rx: mpsc::Receiver<StdinMsg>,
+    tty_size: Option<(u16, u16)>,
 ) {
     use portable_pty::{CommandBuilder, PtySize};
 
     let started = Instant::now();
+    let (init_cols, init_rows) = tty_size.unwrap_or((80, 24));
     let pty_system = portable_pty::native_pty_system();
-    let pair = match pty_system.openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }) {
+    let pair = match pty_system.openpty(PtySize {
+        rows: init_rows,
+        cols: init_cols,
+        pixel_width: 0,
+        pixel_height: 0,
+    }) {
         Ok(p) => p,
         Err(err) => {
             macro_log::w!("创建伪终端失败 {}: {err}", req.program);
@@ -500,16 +436,14 @@ async fn run_pty(
     };
     let master = Arc::new(std::sync::Mutex::new(pair.master));
 
-    // 当前 PTY 尺寸（CPR 应答使用；resize 时更新）
-    let cols_cell = Arc::new(std::sync::atomic::AtomicU16::new(80));
-    let rows_cell = Arc::new(std::sync::atomic::AtomicU16::new(24));
+    // CPR 兜底开关：中继应答（客户端本地终端的真实应答经 stdin 返回）会置位，兜底即取消
+    let answered = Arc::new(AtomicBool::new(false));
 
     // stdin writer 任务（异步）：Data → spawn_blocking 写入 PTY 主端；Resize → 调整尺寸；
     // stdin 通道关闭或会话结束（tx.closed）→ 退出 → master 释放 → ConPTY 关闭 → 输出泵 EOF
     let writer_master = Arc::clone(&master);
-    let writer_cols = Arc::clone(&cols_cell);
-    let writer_rows = Arc::clone(&rows_cell);
     let tx_writer = tx.clone();
+    let writer_answered = Arc::clone(&answered);
     let _writer_task = tokio::spawn(async move {
         let writer = writer_master.lock().unwrap().take_writer().ok();
         let writer = Arc::new(std::sync::Mutex::new(writer));
@@ -524,6 +458,9 @@ async fn run_pty(
             };
             match msg {
                 StdinMsg::Data(data) => {
+                    if is_cpr_reply(&data) {
+                        writer_answered.store(true, Ordering::Relaxed);
+                    }
                     let w = Arc::clone(&writer);
                     let res = tokio::task::spawn_blocking(move || {
                         if let Some(w) = w.lock().unwrap().as_mut() {
@@ -540,8 +477,6 @@ async fn run_pty(
                 }
                 StdinMsg::Eof => break,
                 StdinMsg::Resize { cols, rows } => {
-                    writer_cols.store(cols, Ordering::Relaxed);
-                    writer_rows.store(rows, Ordering::Relaxed);
                     let _ = writer_master
                         .lock()
                         .unwrap()
@@ -551,18 +486,16 @@ async fn run_pty(
         }
     });
 
-    // 输出泵：原始字节原样透传（不转码、不截断）；嗅探 CSI 查询并自动应答。
-    // ConPTY 会把应用（含 docker exec 内层终端）的终端查询转发给真正的终端（即本进程），
-    // 不应答会导致 vim 等全屏程序阻塞在启动握手（node-pty/真实终端同款处理）。
+    // 输出泵：原始字节原样透传（不转码、不截断）；仅嗅探 CPR 查询用于兜底。
+    // 终端查询（CPR/DA/OSC）透传给客户端的本地终端应答，应答经按键流原样返回。
     let tx_reader = tx.clone();
     let cpr_tx = stdin_tx;
-    let reader_cols = Arc::clone(&cols_cell);
-    let reader_rows = Arc::clone(&rows_cell);
+    let reader_answered = Arc::clone(&answered);
     let reader_task = tokio::task::spawn_blocking(move || {
         use std::io::Read as _;
         let mut reader = reader;
         let mut buf = [0u8; 8192];
-        let mut seq: Vec<u8> = Vec::new(); // 跨块收集的 CSI/OSC 序列
+        let mut seq: Vec<u8> = Vec::new(); // 跨块收集的 CSI 序列
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
@@ -573,27 +506,21 @@ async fn run_pty(
                                 seq.push(b);
                             }
                         } else if seq.len() == 1 {
-                            match b {
-                                b'[' | b']' => seq.push(b), // CSI / OSC
-                                0x1b => {}                  // 连续 ESC，维持状态
-                                _ => seq.clear(),
+                            if b == b'[' {
+                                seq.push(b);
+                            } else {
+                                seq.clear();
+                                if b == 0x1b {
+                                    seq.push(b);
+                                }
                             }
-                        } else if seq[1] == b'[' {
+                        } else {
                             seq.push(b);
                             if (0x40..=0x7e).contains(&b) {
-                                respond_csi_query(&seq, &cpr_tx, &reader_cols, &reader_rows);
+                                maybe_cpr_fallback(&seq, &cpr_tx, &reader_answered);
                                 seq.clear();
                             } else if seq.len() >= 32 {
                                 seq.clear(); // 异常序列，放弃
-                            }
-                        } else {
-                            // OSC：等待 BEL 或 ST（ESC \）终止
-                            seq.push(b);
-                            if b == 0x07 || (b == b'\\' && seq.len() >= 2 && seq[seq.len() - 2] == 0x1b) {
-                                respond_osc_query(&seq, &cpr_tx);
-                                seq.clear();
-                            } else if seq.len() >= 128 {
-                                seq.clear();
                             }
                         }
                     }
@@ -658,7 +585,7 @@ mod tests {
             tty: false,
         };
 
-        let (mut rx, tx) = spawn_exec_stdin(&req);
+        let (mut rx, tx) = spawn_exec_stdin(&req, None);
         tx.send(StdinMsg::Data(b"hello stdin\n".to_vec())).await.unwrap();
         tx.send(StdinMsg::Eof).await.unwrap();
         drop(tx);
@@ -701,7 +628,7 @@ mod tests {
             tty: true,
         };
 
-        let (mut rx, _tx) = spawn_exec_stdin(&req);
+        let (mut rx, _tx) = spawn_exec_stdin(&req, None);
         let mut output = String::new();
         let mut exit_code = None;
         let completed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
