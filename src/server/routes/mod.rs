@@ -1,7 +1,7 @@
 pub mod admin;
-pub mod exec;
 pub mod frontend;
 pub mod register;
+pub mod exec_ws;
 
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
@@ -18,7 +18,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             post(register::register).delete(register::self_unregister),
         )
         .route("/api/register/status/{client_id}", get(register::status))
-        .route("/api/exec", post(exec::exec))
+        .route("/api/exec/ws", get(exec_ws::exec_ws))
         .route("/api/admin/login", post(admin::login))
         .route("/api/admin/registrations", get(admin::registrations))
         .route("/api/admin/registrations/{id}/approve", post(admin::approve))

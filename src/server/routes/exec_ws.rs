@@ -1,0 +1,222 @@
+use std::net::SocketAddr;
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, State};
+use axum::response::Response;
+use base64::Engine;
+use futures::{SinkExt, StreamExt};
+use serde::Deserialize;
+
+use crate::server::auth::ClientAuth;
+use crate::server::runner::{self, ExecEvent, ExecRequest, StdinMsg, DEFAULT_TIMEOUT_SECS, MAX_TIMEOUT_SECS};
+use crate::server::state::AppState;
+
+const MAX_STDIN_FRAME: usize = 64 * 1024;
+const MAX_STDIN_TOTAL: u64 = 10 * 1024 * 1024;
+
+/// GET /api/exec/ws：WS 连接即执行会话（upgrade 前经 ClientAuth 认证）
+pub async fn exec_ws(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    ClientAuth(client): ClientAuth,
+    ws: WebSocketUpgrade,
+) -> Response {
+    ws.on_upgrade(move |socket| session(socket, state, client, addr))
+}
+
+#[derive(Deserialize)]
+struct WsInit {
+    program: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+}
+
+fn rejected(reason: &str) -> Message {
+    Message::Text(serde_json::json!({ "type": "rejected", "reason": reason }).to_string().into())
+}
+
+async fn session(mut socket: WebSocket, state: Arc<AppState>, client: crate::server::store::ClientRecord, addr: SocketAddr) {
+    let hostname = client.hostname.clone();
+
+    // 并发限制（连接期间持有）
+    let global = state.global_sem.clone();
+    let per_client = state.per_client(&client.id);
+    let permits = tokio::join!(global.acquire(), per_client.acquire());
+    let (global_permit, client_permit) = match permits {
+        (Ok(g), Ok(c)) => (g, c),
+        _ => {
+            let _ = socket.send(rejected("并发已达上限")).await;
+            let _ = socket.close().await;
+            return;
+        }
+    };
+    let _ = (global_permit, client_permit);
+
+    // 首帧 init（15s 超时防止许可被空占）
+    let init = match tokio::time::timeout(Duration::from_secs(15), read_init(&mut socket)).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(reason)) => {
+            let _ = socket.send(rejected(&reason)).await;
+            let _ = socket.close().await;
+            return;
+        }
+        Err(_) => {
+            let _ = socket.send(rejected("等待 init 帧超时")).await;
+            let _ = socket.close().await;
+            return;
+        }
+    };
+
+    // 白名单校验
+    if init.program.trim().is_empty() || !runner::whitelist_matches(&client.whitelist, &init.program) {
+        state.audit.log(
+            "exec.denied",
+            &hostname,
+            Some(serde_json::json!({ "program": init.program, "args": init.args })),
+        );
+        let _ = socket.send(rejected(&format!("命令未在白名单中: {}", init.program))).await;
+        let _ = socket.close().await;
+        return;
+    }
+
+    let timeout_secs = init.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS).clamp(1, MAX_TIMEOUT_SECS);
+    state.audit.log(
+        "exec.start",
+        &hostname,
+        Some(serde_json::json!({
+            "program": init.program, "args": init.args,
+            "timeout_secs": timeout_secs, "ip": addr.ip().to_string(),
+            "transport": "ws",
+        })),
+    );
+
+    let (mut rx, stdin_tx) = runner::spawn_exec_stdin(&ExecRequest {
+        program: init.program.clone(),
+        args: init.args.clone(),
+        timeout_secs: Some(timeout_secs),
+    });
+
+    if socket.send(Message::Text(serde_json::json!({ "type": "started" }).to_string().into())).await.is_err() {
+        return; // rx 随函数返回被 drop → 子进程被 kill
+    }
+
+    // 下行泵：exec 事件 → WS 帧；Exit 后关闭连接
+    let client_id = client.id.clone();
+    let program = init.program.clone();
+    let program_dl = program.clone();
+    let args = init.args.clone();
+    let audit = Arc::clone(&state.audit);
+    let (mut sink, mut stream) = socket.split();
+    let downlink = tokio::spawn(async move {
+        let program = program_dl;
+        while let Some(ev) = rx.recv().await {
+            let is_exit = matches!(ev, ExecEvent::Exit { .. });
+            let msg = event_message(&ev);
+            if sink.send(msg).await.is_err() {
+                break;
+            }
+            if is_exit {
+                if let ExecEvent::Exit { exit_code, timeout, duration_ms, truncated } = ev {
+                    write_history(&audit, &client_id, &hostname, &program, &args, exit_code, timeout, duration_ms, truncated);
+                    audit.log("exec.finish", &hostname, Some(serde_json::json!({ "program": program })));
+                }
+                let _ = sink.close().await;
+                break;
+            }
+        }
+    });
+
+    // 上行：stdin 数据（本协程）
+    let mut stdin_tx = Some(stdin_tx);
+    let mut total_stdin: u64 = 0;
+    while let Some(msg) = stream.next().await {
+        match msg {
+            Ok(Message::Binary(data)) => {
+                let (Some(tx), true) = (stdin_tx.as_ref(), data.len() <= MAX_STDIN_FRAME) else { break };
+                total_stdin += data.len() as u64;
+                if total_stdin > MAX_STDIN_TOTAL {
+                    macro_log::w!("WS 会话 stdin 超限，断开: {}", program);
+                    break;
+                }
+                if tx.send(StdinMsg::Data(data.to_vec())).await.is_err() {
+                    stdin_tx = None; // 子进程 stdin 已关闭，忽略后续数据
+                }
+            }
+            Ok(Message::Text(t)) => {
+                let is_close = serde_json::from_str::<serde_json::Value>(&t)
+                    .ok()
+                    .and_then(|v| v["type"].as_str().map(|s| s == "stdin_close"))
+                    .unwrap_or(false);
+                if is_close {
+                    stdin_tx = None; // drop = EOF
+                }
+            }
+            Ok(Message::Close(_)) | Err(_) => break,
+            _ => {}
+        }
+    }
+
+    // 上行结束（客户端断连）：释放 rx → tx.closed() 触发子进程终止
+    downlink.abort();
+    drop(stdin_tx);
+}
+
+async fn read_init(socket: &mut WebSocket) -> Result<WsInit, String> {
+    loop {
+        match socket.recv().await {
+            Some(Ok(Message::Text(t))) => {
+                return serde_json::from_str::<WsInit>(&t).map_err(|e| format!("init 帧无效: {e}"));
+            }
+            Some(Ok(_)) => return Err("首帧必须为 init".into()),
+            Some(Err(e)) => return Err(format!("连接错误: {e}")),
+            None => return Err("连接已关闭".into()),
+        }
+    }
+}
+
+/// exec 事件 → WS 帧：stdout=0x01 / stderr=0x02 / 截断标记=0x03；Exit 为 Text JSON
+fn event_message(ev: &ExecEvent) -> Message {
+    match ev {
+        ExecEvent::Output { stream, data_b64 } => {
+            if *stream == "__truncated__" {
+                return Message::Binary(vec![3].into());
+            }
+            let bytes = base64::engine::general_purpose::STANDARD.decode(data_b64).unwrap_or_default();
+            let tag: u8 = if *stream == "stderr" { 2 } else { 1 };
+            let mut frame = Vec::with_capacity(1 + bytes.len());
+            frame.push(tag);
+            frame.extend_from_slice(&bytes);
+            Message::Binary(frame.into())
+        }
+        ExecEvent::Exit { .. } => Message::Text(serde_json::to_string(ev).unwrap_or_default().into()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_history(
+    audit: &crate::server::store::Audit,
+    client_id: &str,
+    hostname: &str,
+    program: &str,
+    args: &[String],
+    exit_code: Option<i32>,
+    timeout: bool,
+    duration_ms: u64,
+    truncated: bool,
+) {
+    audit.log_exec(&crate::server::store::ExecHistory {
+        ts: chrono::Utc::now().to_rfc3339(),
+        client_id: client_id.to_string(),
+        hostname: hostname.to_string(),
+        program: program.to_string(),
+        args: args.to_vec(),
+        exit_code,
+        duration_ms,
+        timeout,
+        truncated,
+    });
+}

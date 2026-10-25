@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
@@ -37,26 +37,37 @@ pub enum ExecEvent {
     },
 }
 
-/// 启动子进程并流式推送输出事件；返回的 Receiver 断开（客户端断连）时子进程被 kill。
-pub fn spawn_exec(req: &ExecRequest) -> mpsc::Receiver<ExecEvent> {
+/// stdin 转发消息：Data 为数据块，Eof 表示关闭子进程 stdin（drop Sender 等价于 Eof）
+#[derive(Debug)]
+pub enum StdinMsg {
+    Data(Vec<u8>),
+    #[allow(dead_code)] // 协议层保留：测试与未来调用方使用
+    Eof,
+}
+
+/// 启动子进程（stdin 已接管）：返回 (输出事件流, stdin 发送端)。
+/// Sender drop 与发送 Eof 等价（关闭子进程 stdin）；输出 Receiver 被 drop（客户端断连）时子进程被 kill。
+pub fn spawn_exec_stdin(req: &ExecRequest) -> (mpsc::Receiver<ExecEvent>, mpsc::Sender<StdinMsg>) {
     let (tx, rx) = mpsc::channel::<ExecEvent>(256);
+    let (stx, srx) = mpsc::channel::<StdinMsg>(32);
     let req = ExecRequest {
         program: req.program.clone(),
         args: req.args.clone(),
         timeout_secs: req.timeout_secs,
     };
     tokio::spawn(async move {
-        run(req, tx).await;
+        run(req, tx, srx).await;
     });
-    rx
+    (rx, stx)
 }
 
-async fn run(req: ExecRequest, tx: mpsc::Sender<ExecEvent>) {
+async fn run(req: ExecRequest, tx: mpsc::Sender<ExecEvent>, mut stdin_rx: mpsc::Receiver<StdinMsg>) {
     let started = Instant::now();
     let truncated = Arc::new(AtomicBool::new(false));
 
     let mut child = match Command::new(&req.program)
         .args(&req.args)
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true)
@@ -77,6 +88,26 @@ async fn run(req: ExecRequest, tx: mpsc::Sender<ExecEvent>) {
             return;
         }
     };
+
+    // stdin writer 任务：消费 StdinMsg → 写入子进程；EOF 后 shutdown 产生 EOF 并排空后续消息
+    let mut child_stdin = child.stdin.take();
+    tokio::spawn(async move {
+        if let Some(mut sin) = child_stdin.take() {
+            while let Some(msg) = stdin_rx.recv().await {
+                match msg {
+                    StdinMsg::Data(data) => {
+                        if sin.write_all(&data).await.is_err() {
+                            break;
+                        }
+                    }
+                    StdinMsg::Eof => break,
+                }
+            }
+            let _ = sin.shutdown().await;
+        }
+        // 排空残余消息，避免发送端阻塞
+        while stdin_rx.recv().await.is_some() {}
+    });
 
     let mut stdout = child.stdout.take().map(BufReader::new);
     let mut stderr = child.stderr.take().map(BufReader::new);
@@ -106,14 +137,32 @@ async fn run(req: ExecRequest, tx: mpsc::Sender<ExecEvent>) {
         .timeout_secs
         .unwrap_or(DEFAULT_TIMEOUT_SECS)
         .clamp(1, MAX_TIMEOUT_SECS);
-    let wait = tokio::time::timeout(Duration::from_secs(timeout_secs), child.wait()).await;
+    enum WaitOut {
+        Code(Option<i32>),
+        Disconnected,
+    }
+    let outcome = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
+        loop {
+            tokio::select! {
+                r = child.wait() => break WaitOut::Code(r.ok().and_then(|s| s.code())),
+                // 所有事件接收端已断开（客户端断连）→ 终止子进程
+                _ = tx.closed() => break WaitOut::Disconnected,
+            }
+        }
+    })
+    .await;
 
-    let (exit_code, timed_out) = match wait {
-        Ok(Ok(status)) => (status.code(), false),
-        Ok(Err(_)) => (None, false),
+    let (exit_code, timed_out) = match outcome {
+        Ok(WaitOut::Code(code)) => (code, false),
+        Ok(WaitOut::Disconnected) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            (None, false)
+        }
         Err(_) => {
             // 超时：kill 后等待读取任务收尾
             let _ = child.kill().await;
+            let _ = child.wait().await;
             (None, true)
         }
     };
@@ -269,6 +318,47 @@ pub fn whitelist_matches(whitelist: &[String], program: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// stdin 数据经 WS 会话转发后应到达子进程（Windows: more 回显；Unix: cat 回显）
+    #[tokio::test]
+    async fn stdin_pipe_forwarded_to_child() {
+        #[cfg(windows)]
+        let req = ExecRequest {
+            program: "cmd".into(),
+            args: ["/C".to_string(), "more".to_string()].to_vec(),
+            timeout_secs: Some(15),
+        };
+        #[cfg(not(windows))]
+        let req = ExecRequest {
+            program: "cat".into(),
+            args: vec![],
+            timeout_secs: Some(15),
+        };
+
+        let (mut rx, tx) = spawn_exec_stdin(&req);
+        tx.send(StdinMsg::Data(b"hello stdin\n".to_vec())).await.unwrap();
+        tx.send(StdinMsg::Eof).await.unwrap();
+        drop(tx);
+
+        let mut stdout = String::new();
+        let mut exit_code = None;
+        while let Some(ev) = rx.recv().await {
+            match ev {
+                ExecEvent::Output { stream, data_b64 } if stream == "stdout" => {
+                    stdout.push_str(&String::from_utf8_lossy(
+                        &base64::engine::general_purpose::STANDARD.decode(&data_b64).unwrap_or_default(),
+                    ));
+                }
+                ExecEvent::Exit { exit_code: c, .. } => {
+                    exit_code = c;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(stdout.contains("hello stdin"), "stdout = {stdout:?}");
+        assert_eq!(exit_code, Some(0));
+    }
 
     #[test]
     fn transcodes_gbk_split_across_chunks() {

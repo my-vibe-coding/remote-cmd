@@ -3,13 +3,11 @@ use std::convert::Infallible;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use axum::body::Body;
 use axum::extract::{Path, Query, Request};
-use axum::http::{header, StatusCode, Uri};
+use axum::http::{StatusCode, Uri};
 use axum::response::Response;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
-use futures::StreamExt;
 use serde::Deserialize;
 
 use crate::client::config::ServerReg;
@@ -362,33 +360,51 @@ struct ExecBody {
     args: Vec<String>,
 }
 
-/// 本地执行：解析别名（含服务器绑定）→ 转发远端 → SSE 原样转发给浏览器
+/// 本地执行：解析别名（含服务器绑定）→ WS 会话（stdin 立即 EOF）→ 映射回 SSE 给浏览器
 async fn exec(Json(body): Json<ExecBody>) -> Result<Response, (StatusCode, String)> {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use axum::response::IntoResponse as _;
+    use base64::Engine as _;
+    use futures::{SinkExt as _, StreamExt as _};
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
     let (server, payload) = crate::client::run_cmd::resolve_exec_target(&body.alias, &body.args)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
     let token = server.token.clone().unwrap_or_default();
-    let resp = crate::client::remote::exec_sse(&server.server_url, &token, &payload)
+    let program = payload["program"].as_str().unwrap_or_default().to_string();
+    let args: Vec<String> = serde_json::from_value(payload["args"].clone())
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let mut ws = crate::client::remote::ws_exec(&server.server_url, &token, &program, &args, None)
         .await
-        .map_err(|e| {
-            // 转发远端错误状态
-            let status = e
-                .downcast_ref::<reqwest::Error>()
-                .and_then(|re| re.status())
-                .map(|s| StatusCode::from_u16(s.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY))
-                .unwrap_or(StatusCode::BAD_GATEWAY);
-            (status, format!("执行请求失败: {e}"))
-        })?;
-    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
-    let stream = resp
-        .bytes_stream()
-        .map(|r| r.map_err(std::io::Error::other));
-    let body = Body::from_stream(stream);
-    Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, "text/event-stream")
-        .header(header::CACHE_CONTROL, "no-cache")
-        .body(body)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("执行请求失败: {e}")))?;
+
+    // Web 页无 stdin 交互：立即 EOF
+    let _ = ws.sink.send(WsMessage::Text(crate::client::remote::STDIN_CLOSE.into())).await;
+
+    // WS 帧 → SSE 事件（与旧 SSE 端点的事件名/负载形状一致，浏览器零改动）
+    let stream = futures::stream::unfold(ws.stream, |mut stream| async move {
+        loop {
+            match stream.next().await {
+                Some(Ok(frame)) => match crate::client::remote::parse_frame(frame) {
+                    Some(crate::client::remote::ExecFrame::Output { stream: s, data }) => {
+                        let data_b64 = base64::engine::general_purpose::STANDARD.encode(data);
+                        let json = serde_json::json!({ "stream": s, "data_b64": data_b64 });
+                        return Some((Ok::<_, std::convert::Infallible>(Event::default().event("output").data(json.to_string())), stream));
+                    }
+                    Some(crate::client::remote::ExecFrame::Exit { exit_code, timeout, duration_ms, truncated }) => {
+                        let json = serde_json::json!({
+                            "exit_code": exit_code, "timeout": timeout,
+                            "duration_ms": duration_ms, "truncated": truncated,
+                        });
+                        return Some((Ok(Event::default().event("exit").data(json.to_string())), stream));
+                    }
+                    None => continue,
+                },
+                Some(Err(_)) | None => return None,
+            }
+        }
+    });
+    Ok(Sse::new(stream).keep_alive(KeepAlive::default()).into_response())
 }
 
 #[derive(Deserialize)]

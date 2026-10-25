@@ -14,7 +14,8 @@ use crate::server::runner::{self, ExecRequest, DEFAULT_TIMEOUT_SECS, MAX_TIMEOUT
 use crate::server::state::AppState;
 
 /// POST /api/exec：凭证认证 → 并发限制 → 白名单校验 → SSE 流式执行
-pub async fn exec(
+#[deprecated(note = "请改用 exec_ws 函数")]
+pub async fn exec_sse(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     ClientAuth(client): ClientAuth,
