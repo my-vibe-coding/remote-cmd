@@ -187,9 +187,6 @@ async fn run(req: ExecRequest, tx: mpsc::Sender<ExecEvent>, mut stdin_rx: mpsc::
         let _ = task.await;
     }
 
-    // 等待 stdout/stderr 句柄完全关闭（wait 后句柄仍可能残留缓冲）
-    let _ = child;
-
     let _ = tx
         .send(ExecEvent::Exit {
             exit_code,
