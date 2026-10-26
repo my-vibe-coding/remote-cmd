@@ -216,18 +216,23 @@ async fn status() -> Result<Json<serde_json::Value>, (StatusCode, String)> {
         let mut status = if reg.registered { "approved" } else { "pending" }.to_string();
         if !reg.client_id.is_empty() {
             match fetch_remote_status(&reg.server_url, &reg.client_id).await {
-                Ok((remote_status, resp)) => {
+                Ok((remote_status, _)) => {
                     match remote_status.as_str() {
                         "approved" => {
-                            if let Some(t) = resp["token"].as_str()
-                                && reg.token.as_deref() != Some(t)
-                                    && let Some(e) =
-                                        config.servers.iter_mut().find(|s| s.server_url == reg.server_url)
-                                    {
-                                        e.token = Some(t.to_string());
-                                        e.registered = true;
-                                        changed = true;
-                                    }
+                            // status 端点不再下发 token：本地无凭证时凭指纹重新 POST /api/register 幂等领取
+                            if reg.token.is_none()
+                                && let Ok(claim) =
+                                    crate::client::remote::register(&reg.server_url, &MachineInfo::collect()).await
+                                    && let Some(t) = claim["token"].as_str()
+                                        && let Some(e) = config
+                                            .servers
+                                            .iter_mut()
+                                            .find(|s| s.server_url == reg.server_url)
+                                        {
+                                            e.token = Some(t.to_string());
+                                            e.registered = true;
+                                            changed = true;
+                                        }
                             status = "approved".into();
                         }
                         "rejected" | "revoked" => {

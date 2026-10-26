@@ -77,11 +77,18 @@ pub async fn registrations(
 }
 
 /// POST /api/admin/registrations/{id}/approve
+/// 幂等：已批准记录重复调用时返回原 token，避免旧凭证被静默轮换
 pub async fn approve(
     State(state): State<Arc<AppState>>,
     _admin: AdminAuth,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let existing = state.store.find_by_id(&id).ok_or((StatusCode::NOT_FOUND, "申请不存在".to_string()))?;
+    if existing.status == ClientStatus::Approved
+        && let Some(token) = &existing.token
+    {
+        return Ok(Json(serde_json::json!({ "client_id": existing.id, "token": token })));
+    }
     let record = state.store.update(&id, |c| {
         c.status = ClientStatus::Approved;
         c.token = Some(crypto::random_token());

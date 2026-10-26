@@ -128,18 +128,26 @@ pub async fn self_unregister(
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
-/// GET /api/register/status/{client_id}：轮询审批状态
+/// GET /api/register/status/{client_id}：轮询审批状态。
+/// 安全：不返回 token（审批通过后由客户端凭指纹重新 POST /api/register 领取），并限流防滥用轮询。
 pub async fn status(
     State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
     Path(client_id): Path<String>,
 ) -> Result<Json<RegisterResponse>, (StatusCode, String)> {
+    if !state
+        .rate
+        .check("register", addr.ip(), crate::server::rate_limit::REGISTER_LIMIT, crate::server::rate_limit::REGISTER_WINDOW)
+    {
+        return Err((StatusCode::TOO_MANY_REQUESTS, "请求过于频繁，请稍后再试".into()));
+    }
     let Some(record) = state.store.find_by_id(&client_id) else {
         return Err((StatusCode::NOT_FOUND, "申请不存在".into()));
     };
     Ok(Json(RegisterResponse {
         client_id: record.id,
         status: record.status,
-        token: record.token,
+        token: None,
         hostname: Some(record.hostname),
     }))
 }
