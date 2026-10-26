@@ -107,15 +107,25 @@ pub fn save_aliases(aliases: &Aliases) -> AppResult<()> {
     save_json_atomic(&aliases_path(), aliases)
 }
 
-/// 模板渲染：{args} 占位替换
+/// 模板渲染：{args} 占位替换。
+/// 参数会做引号包裹转义（含空格/制表符/引号/空参数），保证经 shlex_split 还原后与原始参数一一对应。
 pub fn render_template(template: &str, args: &[String]) -> String {
-    let joined = args.join(" ");
+    let joined = args.iter().map(|a| quote_arg(a)).collect::<Vec<_>>().join(" ");
     if template.contains("{args}") {
         template.replace("{args}", &joined)
     } else if !args.is_empty() {
         format!("{template} {joined}")
     } else {
         template.to_string()
+    }
+}
+
+/// 单个参数的 shell 转义：含空白/引号或为空时用双引号包裹，内部双引号转义为 \"
+fn quote_arg(arg: &str) -> String {
+    if arg.is_empty() || arg.chars().any(|c| c == ' ' || c == '\t' || c == '"') {
+        format!("\"{}\"", arg.replace('"', "\\\""))
+    } else {
+        arg.to_string()
     }
 }
 
@@ -127,14 +137,20 @@ pub fn parse_command_line(cmd: &str) -> Option<(String, Vec<String>)> {
     Some((program, it.collect()))
 }
 
-/// 简易 shell 分词：支持双引号
+/// 简易 shell 分词：支持双引号与 \" 转义
 fn shlex_split(s: &str) -> Vec<String> {
     let mut out = vec![];
     let mut cur = String::new();
     let mut in_quote = false;
     let mut has_token = false;
-    for c in s.chars() {
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
         match c {
+            // \" → 字面双引号（与 quote_arg 的转义配对）
+            '\\' if chars.peek() == Some(&'"') => {
+                cur.push('"');
+                has_token = true;
+            }
             '"' => {
                 in_quote = !in_quote;
                 has_token = true;
@@ -155,4 +171,25 @@ fn shlex_split(s: &str) -> Vec<String> {
         out.push(cur);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 渲染→分词往返：含空格/引号/空串的参数应与原始参数一一对应
+    #[test]
+    fn render_then_split_preserves_args_with_spaces() {
+        let args = vec![
+            "hello world".to_string(),
+            "say \"hi\"".to_string(),
+            "plain".to_string(),
+            String::new(),
+        ];
+        let cmdline = render_template("git add {args}", &args);
+        let (program, rest) = parse_command_line(&cmdline).unwrap();
+        assert_eq!(program, "git");
+        assert_eq!(rest[0], "add");
+        assert_eq!(&rest[1..], args.as_slice());
+    }
 }

@@ -154,7 +154,12 @@ async fn session(mut socket: WebSocket, state: Arc<AppState>, client: crate::ser
     while let Some(msg) = stream.next().await {
         match msg {
             Ok(Message::Binary(data)) => {
-                let (Some(tx), true) = (stdin_tx.as_ref(), data.len() <= MAX_STDIN_FRAME) else { break };
+                let Some(tx) = stdin_tx.as_ref() else { continue }; // 子进程 stdin 已关闭：忽略后续数据
+                if data.len() > MAX_STDIN_FRAME {
+                    // 超限帧丢弃而非断开会话（正常客户端按 4KB 分块，异常客户端不应殃及会话）
+                    macro_log::w!("WS 会话 stdin 帧超限已丢弃: {} ({} bytes)", program, data.len());
+                    continue;
+                }
                 total_stdin += data.len() as u64;
                 if total_stdin > MAX_STDIN_TOTAL {
                     macro_log::w!("WS 会话 stdin 超限，断开: {}", program);
@@ -171,12 +176,16 @@ async fn session(mut socket: WebSocket, state: Arc<AppState>, client: crate::ser
                         stdin_tx = None; // drop = EOF
                     }
                     Some("resize") => {
-                        let cols = v.as_ref().and_then(|v| v["cols"].as_u64()).unwrap_or(0) as u16;
-                        let rows = v.as_ref().and_then(|v| v["rows"].as_u64()).unwrap_or(0) as u16;
-                        if cols > 0 && rows > 0 {
-                            let _ = stdin_tx
-                                .as_ref()
-                                .map(|tx| tx.try_send(StdinMsg::Resize { cols, rows }));
+                        let cols = v.as_ref().and_then(|v| v["cols"].as_u64()).unwrap_or(0);
+                        let rows = v.as_ref().and_then(|v| v["rows"].as_u64()).unwrap_or(0);
+                        // 与 init 帧一致的范围校验（防 u16 截断成异常小值）
+                        if cols > 0 && rows > 0 && cols <= 1024 && rows <= 1024 {
+                            let _ = stdin_tx.as_ref().map(|tx| {
+                                tx.try_send(StdinMsg::Resize {
+                                    cols: cols as u16,
+                                    rows: rows as u16,
+                                })
+                            });
                         }
                     }
                     _ => {}
