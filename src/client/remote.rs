@@ -127,6 +127,15 @@ pub async fn ws_exec(
     let (mut sink, mut stream) = ws.split();
 
     let (cols, rows) = tty_size.unwrap_or((0, 0));
+    macro_log::d!(
+        "[ws] 客户端发起执行会话 {} program={} args={:?} tty={} size={}x{}",
+        server_url,
+        program,
+        args,
+        tty,
+        cols,
+        rows
+    );
     let init = serde_json::json!({
         "type": "init",
         "program": program,
@@ -144,9 +153,11 @@ pub async fn ws_exec(
                 let v: Value = serde_json::from_str(&t)?;
                 match v["type"].as_str() {
                     Some("started") => {
+                        macro_log::d!("[ws] 服务端已确认会话启动（started）");
                         return Ok(ExecWs { sink, stream });
                     }
                     Some("rejected") => {
+                        macro_log::d!("[ws] 服务端拒绝会话: {}", v["reason"].as_str().unwrap_or(""));
                         anyhow::bail!("{}", v["reason"].as_str().unwrap_or("执行被拒绝"));
                     }
                     _ => {}

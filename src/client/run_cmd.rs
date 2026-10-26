@@ -167,11 +167,32 @@ async fn run_pty_session(
         while let Some(a) = irx.recv().await {
             let msg = match a {
                 InputAction::Data(d) => match reply_filter.feed(&d) {
-                    filtered if filtered.is_empty() => continue, // 终端应答被吞掉，不转发远端
-                    filtered => WsMessage::Binary(filtered.into()),
+                    filtered if filtered.is_empty() && !d.is_empty() => {
+                        macro_log::d!(
+                            "[pty-in] 客户端过滤器吞掉本地应答 {} 字节: {}",
+                            d.len(),
+                            crate::common::escape_bytes(&d)
+                        );
+                        continue; // 终端应答被吞掉，不转发远端
+                    }
+                    filtered => {
+                        if !d.is_empty() {
+                            macro_log::d!(
+                                "[pty-in] 客户端输入 {} 字节 -> 转发 {} 字节: {}",
+                                d.len(),
+                                filtered.len(),
+                                crate::common::escape_bytes(&filtered)
+                            );
+                        }
+                        WsMessage::Binary(filtered.into())
+                    }
                 },
-                InputAction::Resize(c, r) => resize_msg(c, r),
+                InputAction::Resize(c, r) => {
+                    macro_log::d!("[pty-in] 客户端上报终端尺寸 {}x{}", c, r);
+                    resize_msg(c, r)
+                }
                 InputAction::Detach => {
+                    macro_log::d!("[pty-in] 客户端脱离会话（Ctrl+]）");
                     let _ = detach_tx.send(()).await;
                     break;
                 }
@@ -194,6 +215,13 @@ async fn run_pty_session(
             maybe = stream.next() => match maybe {
                 Some(Ok(frame)) => match parse_frame(frame) {
                     Some(ExecFrame::Output { data, .. }) => {
+                        if crate::common::looks_like_query(&data) {
+                            macro_log::d!(
+                                "[pty-out] 客户端收到远端查询 {} 字节: {}",
+                                data.len(),
+                                crate::common::escape_bytes(&data)
+                            );
+                        }
                         let mut out = std::io::stdout();
                         let _ = out.write_all(&data);
                         let _ = out.flush();
