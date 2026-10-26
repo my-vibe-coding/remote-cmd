@@ -293,6 +293,8 @@ enum FilterState {
     Esc,
     /// ESC[ CSI 收集中，直到终结字节
     Csi,
+    /// 裸 `[` 收集中：ConPTY/crossterm 会吞掉应答序列的 ESC，残余以 `[` 开头逐键到达
+    Naked,
     /// ESC] OSC 收集中，直到 BEL/ST
     Osc,
     /// OSC 内出现 ESC（可能是 ST 前半）
@@ -316,8 +318,39 @@ impl ReplyFilter {
                     if b == 0x1b {
                         self.pending.push(b);
                         self.state = FilterState::Esc;
+                    } else if b == b'[' {
+                        // 无 ESC 前缀的 `[`：可能是被吞掉 ESC 的应答残余，收集判定
+                        self.pending.clear();
+                        self.pending.push(b);
+                        self.state = FilterState::Naked;
                     } else {
                         out.push(b);
+                    }
+                }
+                FilterState::Naked => {
+                    // 终结判定先于压入：pending[1..] 为已收集参数（不含当前字节）
+                    if (b == b'R' || b == b'c')
+                        && self.pending.len() > 1
+                        && self.pending[1..].iter().all(|&c| {
+                            c.is_ascii_digit() || matches!(c, b';' | b'?' | b'>' | b'<' | b'=' | b':')
+                        })
+                    {
+                        // 应答形状（如 [10;1R / [?1;0c / [>0;10;1c）：吞掉
+                        self.pending.clear();
+                        self.state = FilterState::Normal;
+                    } else if b.is_ascii_digit()
+                        || matches!(b, b';' | b'?' | b'>' | b'<' | b'=' | b':')
+                    {
+                        self.pending.push(b);
+                        if self.pending.len() >= 32 {
+                            out.append(&mut self.pending);
+                            self.state = FilterState::Normal;
+                        }
+                    } else {
+                        // 非参数字符（字母/[ 等，vim 的 [c/[d 等按键）：立即放行
+                        out.append(&mut self.pending);
+                        out.push(b);
+                        self.state = FilterState::Normal;
                     }
                 }
                 FilterState::Esc => match b {
@@ -491,6 +524,34 @@ pub fn resolve_exec_target(alias: &str, args: &[String]) -> Result<(ServerReg, s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 无 ESC 前缀的应答残余（ConPTY/crossterm 吞掉 ESC 后逐键到达）应被吞掉
+    #[test]
+    fn reply_filter_swallows_naked_reply_remainder() {
+        let mut f = ReplyFilter::new();
+        // 逐字节喂入（模拟 crossterm 逐键转发）
+        for b in b"[10;1R" {
+            assert_eq!(f.feed(&[*b]), b"");
+        }
+        let mut f = ReplyFilter::new();
+        assert_eq!(f.feed(b"[?1;0c"), b"");
+        let mut f = ReplyFilter::new();
+        assert_eq!(f.feed(b"[>0;10;1c"), b"");
+        // 混合：应答后接普通输入
+        let mut f = ReplyFilter::new();
+        assert_eq!(f.feed(b"[10;1Rls"), b"ls");
+    }
+
+    /// vim 的 [ 类按键（[c/[d/[Z）不应被误吞
+    #[test]
+    fn reply_filter_passes_vim_bracket_keys() {
+        let mut f = ReplyFilter::new();
+        assert_eq!(f.feed(b"[c"), b"[c"); // 空参数放行
+        let mut f = ReplyFilter::new();
+        assert_eq!(f.feed(b"[d"), b"[d");
+        let mut f = ReplyFilter::new();
+        assert_eq!(f.feed(b"[Z"), b"[Z");
+    }
 
     /// CPR 应答应被吞掉（单块与跨块拆分）
     #[test]

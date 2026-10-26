@@ -340,15 +340,15 @@ fn maybe_query_fallback(seq: &[u8], tx: &mpsc::Sender<StdinMsg>) {
         _ => return,
     };
     macro_log::d!(
-        "[pty-query] 服务端检测到查询 {}，300ms 后兜底应答 {}",
+        "[pty-query] 服务端检测到查询 {}，立即兜底应答 {}",
         crate::common::escape_bytes(seq),
         crate::common::escape_bytes(reply)
     );
     let reply = reply.to_vec();
     let tx = tx.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        macro_log::d!("[pty-query] 兜底应答已写入 stdin 通道: {}", crate::common::escape_bytes(&reply));
+        // 立即发送：客户端已过滤本地终端的应答回流，不存在竞争来源；
+        // 延迟会让慢到的兜底应答与后续查询交叉（DA2 查询收到 DA1 应答等串台现象）
         let _ = tx.send(StdinMsg::Data(reply)).await;
     });
 }
@@ -368,14 +368,12 @@ fn maybe_osc_query_fallback(seq: &[u8], tx: &mpsc::Sender<StdinMsg>) {
     };
     let reply = format!("\x1b]{};rgb:{}\x1b\\", String::from_utf8_lossy(num), color);
     macro_log::d!(
-        "[pty-query] 服务端检测到 OSC 查询 {}，300ms 后兜底应答 {}",
+        "[pty-query] 服务端检测到 OSC 查询 {}，立即兜底应答 {}",
         crate::common::escape_bytes(seq),
         crate::common::escape_bytes(reply.as_bytes())
     );
     let tx = tx.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        macro_log::d!("[pty-query] OSC 兜底应答已写入 stdin 通道: {}", reply);
         let _ = tx.send(StdinMsg::Data(reply.into_bytes())).await;
     });
 }
