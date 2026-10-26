@@ -76,7 +76,8 @@ pub async fn serve(port: u16, password: Option<String>, data_dir: Option<String>
     // 公网地址后台获取（最多 5s 外部请求），不阻塞监听启动
     tokio::spawn(async move {
         if let Some(ip) = crate::common::net::fetch_public_ipv4().await {
-            macro_log::i!("公网地址（需端口可达）: https://{ip}:{port}/admin");
+            macro_log::i!("管理页面（公网）: https://{ip}:{port}/admin");
+            macro_log::i!("注册地址（公网）: https://{ip}:{port}");
         }
     });
 

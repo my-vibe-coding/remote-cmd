@@ -160,12 +160,16 @@ async fn run_pty_session(
         }
     });
 
-    // 输入转发任务：本地事件 → WS 帧；Detach 时通知主循环断开
+    // 输入转发任务：本地事件 → WS 帧（经 ReplyFilter 吞掉终端应答序列）；Detach 时通知主循环断开
     let (detach_tx, mut detach_rx) = mpsc::channel::<()>(1);
+    let mut reply_filter = ReplyFilter::new();
     let forward = tokio::spawn(async move {
         while let Some(a) = irx.recv().await {
             let msg = match a {
-                InputAction::Data(d) => WsMessage::Binary(d.into()),
+                InputAction::Data(d) => match reply_filter.feed(&d) {
+                    filtered if filtered.is_empty() => continue, // 终端应答被吞掉，不转发远端
+                    filtered => WsMessage::Binary(filtered.into()),
+                },
                 InputAction::Resize(c, r) => resize_msg(c, r),
                 InputAction::Detach => {
                     let _ = detach_tx.send(()).await;
@@ -179,8 +183,10 @@ async fn run_pty_session(
     });
 
     // 输出泵：PTY 输出为原始 ANSI 字节，直接写本地终端（不做任何过滤）。
-    // 终端查询（CPR/DA/OSC）透传给本地终端应答——本地终端知道真实光标位置/颜色，
-    // 应答经本地输入→按键转发原样回到远端（与 WT+ssh 链路等价）。
+    // 远端程序的终端查询（CPR/DA/OSC）随之透传到本地终端显示；但本地终端的应答
+    // 会在输入侧被 ReplyFilter 吞掉，远端查询由服务端确定性兜底应答（见 runner.rs）。
+    // 不透传应答的原因：ConPTY 会抢答查询（conhost 内置 DA/CPR 应答），且其启动
+    // 握手应答也以按键事件回流，原样转发会在查询方放弃等待后污染远端输入缓冲。
     let mut exit_code: Option<i32> = None;
     let mut detached = false;
     loop {
@@ -229,11 +235,142 @@ async fn run_pty_session(
     }
 }
 
-/// raw mode 兜底恢复：正常返回路径经 Drop 关闭；process::exit 路径需在此之前手动 disable
+/// raw mode 兜底恢复：正常返回路径经 Drop 关闭；process::exit 路径需在此之前手动关闭
 struct RawModeGuard;
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+/// 本地输入中的"终端应答序列"过滤器。
+///
+/// ConPTY 环境下，本地终端对远端查询的应答会以按键事件形式回流（含 ConPTY 自身
+/// 启动握手 `ESC[6n` 的应答）。若原样转发给远端，会在查询方（tmux 等）放弃等待后
+/// 到达，成为残留在输入缓冲的垃圾——表现为 shell 提示符后回显 `[?61;4;...c` 等。
+/// 远端查询由服务端确定性兜底应答，因此转发前按状态机吞掉以下应答序列
+/// （支持跨事件拆分重组）：
+/// - CPR 应答 `ESC[<数字>;]R`
+/// - DA 应答 `ESC[?<数字>;]c`
+/// - OSC 应答 `ESC]...BEL` / `ESC]...ESC\`
+struct ReplyFilter {
+    pending: Vec<u8>,
+    state: FilterState,
+}
+
+enum FilterState {
+    /// 普通：字节直接放行（ESC 单独收集待定）
+    Normal,
+    /// 已见 ESC，待判定序列类型
+    Esc,
+    /// ESC[ CSI 收集中，直到终结字节
+    Csi,
+    /// ESC] OSC 收集中，直到 BEL/ST
+    Osc,
+    /// OSC 内出现 ESC（可能是 ST 前半）
+    OscEsc,
+}
+
+impl ReplyFilter {
+    fn new() -> Self {
+        ReplyFilter {
+            pending: Vec::new(),
+            state: FilterState::Normal,
+        }
+    }
+
+    /// 喂入一批按键字节，返回应转发给远端的字节（应答序列被吞掉）
+    fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len());
+        for &b in bytes {
+            match self.state {
+                FilterState::Normal => {
+                    if b == 0x1b {
+                        self.pending.push(b);
+                        self.state = FilterState::Esc;
+                    } else {
+                        out.push(b);
+                    }
+                }
+                FilterState::Esc => match b {
+                    b'[' => {
+                        self.pending.push(b);
+                        self.state = FilterState::Csi;
+                    }
+                    b']' => {
+                        self.pending.push(b);
+                        self.state = FilterState::Osc;
+                    }
+                    _ => {
+                        // 非查询/应答形状的转义序列（如 Alt+键）：整体放行
+                        self.pending.push(b);
+                        out.append(&mut self.pending);
+                        self.state = FilterState::Normal;
+                    }
+                },
+                FilterState::Csi => {
+                    self.pending.push(b);
+                    if (0x40..=0x7e).contains(&b) {
+                        if self.is_reply_sequence() {
+                            self.pending.clear(); // 吞掉应答
+                        } else {
+                            out.append(&mut self.pending);
+                        }
+                        self.state = FilterState::Normal;
+                    } else if self.pending.len() >= 64 {
+                        // 异常超长（非完整序列）：放行防卡死
+                        out.append(&mut self.pending);
+                        self.state = FilterState::Normal;
+                    }
+                }
+                FilterState::Osc => match b {
+                    0x07 => {
+                        // BEL 终结：OSC 应答吞掉
+                        self.pending.clear();
+                        self.state = FilterState::Normal;
+                    }
+                    0x1b => {
+                        self.pending.push(b);
+                        self.state = FilterState::OscEsc;
+                    }
+                    _ => {
+                        self.pending.push(b);
+                        if self.pending.len() >= 256 {
+                            out.append(&mut self.pending);
+                            self.state = FilterState::Normal;
+                        }
+                    }
+                },
+                FilterState::OscEsc => {
+                    if b == b'\\' {
+                        // ST 终结：OSC 应答吞掉
+                        self.pending.clear();
+                    } else {
+                        // 非法 OSC 终结：放行已收集内容
+                        self.pending.push(b);
+                        out.append(&mut self.pending);
+                    }
+                    self.state = FilterState::Normal;
+                }
+            }
+        }
+        out
+    }
+
+    /// 判定已收集的完整 CSI 序列是否为终端应答（pending = ESC [ params... final）
+    fn is_reply_sequence(&self) -> bool {
+        let final_byte = *self.pending.last().unwrap();
+        let params = &self.pending[2..self.pending.len() - 1];
+        let params_valid = params
+            .iter()
+            .all(|&b| b.is_ascii_digit() || b == b';' || b == b'?');
+        match final_byte {
+            // CPR 应答（ESC[1;1R）
+            b'R' => params_valid,
+            // DA 应答（ESC[?61;...c）
+            b'c' => params_valid,
+            _ => false,
+        }
     }
 }
 
@@ -326,6 +463,47 @@ pub fn resolve_exec_target(alias: &str, args: &[String]) -> Result<(ServerReg, s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CPR 应答应被吞掉（单块与跨块拆分）
+    #[test]
+    fn reply_filter_swallows_cpr_reply() {
+        let mut f = ReplyFilter::new();
+        assert_eq!(f.feed(b"\x1b[1;1R"), b"");
+        let mut f = ReplyFilter::new();
+        assert_eq!(f.feed(b"\x1b"), b""); // ESC 单独到达
+        assert_eq!(f.feed(b"[1;"), b"");
+        assert_eq!(f.feed(b"1R"), b"");
+    }
+
+    /// WT 风格 DA1 应答（截图中的乱码本体）应被吞掉
+    #[test]
+    fn reply_filter_swallows_da_reply() {
+        let mut f = ReplyFilter::new();
+        let da = b"\x1b[?61;4;6;7;14;21;22;23;24;28;32;42;52c";
+        assert_eq!(f.feed(da), b"");
+    }
+
+    /// OSC 应答（BEL / ST 终结）应被吞掉
+    #[test]
+    fn reply_filter_swallows_osc_reply() {
+        let mut f = ReplyFilter::new();
+        assert_eq!(f.feed(b"\x1b]11;rgb:1c1c/1c1c/1c1c\x07"), b"");
+        let mut f = ReplyFilter::new();
+        assert_eq!(f.feed(b"\x1b]11;rgb:0000/0000/0000\x1b\\"), b"");
+    }
+
+    /// 普通按键与非应答转义序列应原样放行
+    #[test]
+    fn reply_filter_passes_normal_input() {
+        let mut f = ReplyFilter::new();
+        assert_eq!(f.feed(b"ls -la\r"), b"ls -la\r");
+        assert_eq!(f.feed(b"\x1b[A"), b"\x1b[A"); // 方向键
+        assert_eq!(f.feed(b"\x1b[Z"), b"\x1b[Z"); // BackTab
+        assert_eq!(f.feed(b"\x1b[Z\x1b[1;1R"), b"\x1b[Z"); // 混合
+        assert_eq!(f.feed(b"\x1b[1;1Rabc"), b"abc"); // 应答后接普通输入
+        assert_eq!(f.feed(b"\x1bo"), b"\x1bo"); // ESC+非序列字符（Alt+o）
+        assert_eq!(f.feed(b"\x1b"), b""); // 悬空 ESC 留待下批
+    }
 
     /// 端到端验证别名模板渲染：REMOTE_CMD_HOME 隔离 + 写入别名与服务器配置
     #[test]

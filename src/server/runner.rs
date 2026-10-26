@@ -328,38 +328,27 @@ pub fn whitelist_matches(whitelist: &[String], program: &str) -> bool {
     whitelist.iter().any(|entry| entry.trim().to_lowercase() == name)
 }
 
-/// CPR 兜底应答：seq 为完整的 ESC[...final 序列时，若为 6n 查询则安排 1.5s 后兜底应答
-/// （正常情况由客户端本地终端真实应答并经 stdin 中继返回；兜底仅在中继失效时触发，防止 ConPTY 启动握手卡死）。
-fn maybe_cpr_fallback(seq: &[u8], tx: &mpsc::Sender<StdinMsg>, answered: &Arc<AtomicBool>) {
-    if seq != b"\x1b[6n" {
-        return;
-    }
+/// 查询兜底应答：远端程序的终端查询（CPR/DA1）由服务端确定性应答。
+/// 客户端已在输入侧过滤本地终端的应答回流（ConPTY 会抢答且时序不可控，透传必然
+/// 产生迟到的垃圾输入），因此兜底是远端查询的唯一应答来源；同时覆盖服务端侧
+/// ConPTY 的启动握手（Windows 服务端下 ConPTY 会向宿主终端发 ESC[6n，不应答会卡死会话）。
+fn maybe_query_fallback(seq: &[u8], tx: &mpsc::Sender<StdinMsg>) {
+    let reply: &[u8] = match seq {
+        b"\x1b[6n" => b"\x1b[1;1R", // CPR：光标位置
+        b"\x1b[c" => b"\x1b[?1;0c", // DA1：VT100 级保守应答
+        _ => return,
+    };
     let tx = tx.clone();
-    let answered = Arc::clone(answered);
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        // 中继应答（任何 CPR 样式数据）会置位 answered；未置位才兜底
-        if !answered.swap(true, Ordering::Relaxed) {
-            let _ = tx.send(StdinMsg::Data(b"\x1b[1;1R".to_vec())).await;
-        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let _ = tx.send(StdinMsg::Data(reply.to_vec())).await;
     });
-}
-
-/// CPR 样式应答识别（用于置位兜底开关）：ESC[ + 数字/;/? + R
-fn is_cpr_reply(data: &[u8]) -> bool {
-    data.len() >= 4
-        && data[0] == 0x1b
-        && data[1] == b'['
-        && data[data.len() - 1] == b'R'
-        && data[2..data.len() - 1]
-            .iter()
-            .all(|b| b.is_ascii_digit() || *b == b';' || *b == b'?')
 }
 
 /// PTY 会话：伪终端 + ANSI 原样透传（Windows ConPTY / Unix openpty）。
 /// 无 stdout/stderr 区分（stream="pty"）、无输出截断、无超时；客户端断连时 kill 子进程。
-/// 终端查询（CPR/DA/OSC）透传给客户端的本地终端应答，经按键流原样回到本端（与 WT+ssh 链路等价）；
-/// 仅 CPR 保持 1.5s 兜底应答（ConPTY 启动握手会阻塞等待 ESC[6n 应答，若中继失效则会话卡死）。
+/// 终端查询（CPR/DA1）由本端确定性兜底应答（见 maybe_query_fallback），其余输出原样透传；
+/// 客户端输入侧已过滤本地终端的应答回流，不会产生迟到的垃圾输入。
 async fn run_pty(
     req: ExecRequest,
     tx: mpsc::Sender<ExecEvent>,
@@ -433,14 +422,10 @@ async fn run_pty(
     };
     let master = Arc::new(std::sync::Mutex::new(pair.master));
 
-    // CPR 兜底开关：中继应答（客户端本地终端的真实应答经 stdin 返回）会置位，兜底即取消
-    let answered = Arc::new(AtomicBool::new(false));
-
     // stdin writer 任务（异步）：Data → spawn_blocking 写入 PTY 主端；Resize → 调整尺寸；
     // stdin 通道关闭或会话结束（tx.closed）→ 退出 → master 释放 → ConPTY 关闭 → 输出泵 EOF
     let writer_master = Arc::clone(&master);
     let tx_writer = tx.clone();
-    let writer_answered = Arc::clone(&answered);
     let _writer_task = tokio::spawn(async move {
         let writer = writer_master.lock().unwrap().take_writer().ok();
         let writer = Arc::new(std::sync::Mutex::new(writer));
@@ -455,9 +440,6 @@ async fn run_pty(
             };
             match msg {
                 StdinMsg::Data(data) => {
-                    if is_cpr_reply(&data) {
-                        writer_answered.store(true, Ordering::Relaxed);
-                    }
                     let w = Arc::clone(&writer);
                     let res = tokio::task::spawn_blocking(move || {
                         if let Some(w) = w.lock().unwrap().as_mut() {
@@ -483,11 +465,9 @@ async fn run_pty(
         }
     });
 
-    // 输出泵：原始字节原样透传（不转码、不截断）；仅嗅探 CPR 查询用于兜底。
-    // 终端查询（CPR/DA/OSC）透传给客户端的本地终端应答，应答经按键流原样返回。
+    // 输出泵：原始字节原样透传（不转码、不截断）；嗅探 CPR/DA1 查询用于兜底应答。
     let tx_reader = tx.clone();
     let cpr_tx = stdin_tx;
-    let reader_answered = Arc::clone(&answered);
     let reader_task = tokio::task::spawn_blocking(move || {
         use std::io::Read as _;
         let mut reader = reader;
@@ -514,7 +494,7 @@ async fn run_pty(
                         } else {
                             seq.push(b);
                             if (0x40..=0x7e).contains(&b) {
-                                maybe_cpr_fallback(&seq, &cpr_tx, &reader_answered);
+                                maybe_query_fallback(&seq, &cpr_tx);
                                 seq.clear();
                             } else if seq.len() >= 32 {
                                 seq.clear(); // 异常序列，放弃
@@ -563,6 +543,32 @@ async fn run_pty(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CPR/DA1 查询应触发兜底应答，非查询序列不应答
+    #[tokio::test]
+    async fn query_fallback_replies_to_cpr_and_da1() {
+        let (tx, mut rx) = mpsc::channel(8);
+        maybe_query_fallback(b"\x1b[6n", &tx);
+        maybe_query_fallback(b"\x1b[c", &tx);
+        maybe_query_fallback(b"\x1b[?25h", &tx); // 非查询，不应答
+
+        let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("CPR 兜底超时");
+        let second = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("DA1 兜底超时");
+        match (first, second) {
+            (Some(StdinMsg::Data(a)), Some(StdinMsg::Data(b))) => {
+                assert_eq!(a, b"\x1b[1;1R");
+                assert_eq!(b, b"\x1b[?1;0c");
+            }
+            _ => panic!("兜底应答类型错误"),
+        }
+        // 无第三条消息（非查询未应答）
+        let third = tokio::time::timeout(Duration::from_millis(400), rx.recv()).await;
+        assert!(third.is_err(), "非查询序列不应触发应答");
+    }
 
     /// stdin 数据经 WS 会话转发后应到达子进程（Windows: more 回显；Unix: cat 回显）
     #[tokio::test]
