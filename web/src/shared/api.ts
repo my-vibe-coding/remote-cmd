@@ -191,7 +191,7 @@ export const localApi = {
   script: (alias: string) =>
     localRequest<{ path: string; bin_dir: string }>('POST', '/api/local/script', { alias }),
 
-  /** 删除别名对应的 .bat 脚本 */
+  /** 删除别名对应的可执行脚本（exe shim） */
   deleteScript: (name: string) =>
     localRequest<{ ok: boolean }>(
       'DELETE',

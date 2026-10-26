@@ -48,9 +48,8 @@ export default defineConfig({
       // 管理端相关 API → 远端服务端
       '/api/admin': toRemoteServer,
       '/api/register': toRemoteServer,
-      '/api/exec': toRemoteServer,
       '/api/health': toRemoteServer,
-      // 客户端本地 API → 本机服务
+      // 客户端本地 API → 本机服务（执行命令走 /api/local/exec）
       '/api/local': {
         target: 'http://127.0.0.1:3234',
         changeOrigin: true,
