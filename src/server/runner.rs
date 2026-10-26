@@ -337,6 +337,8 @@ fn maybe_query_fallback(seq: &[u8], tx: &mpsc::Sender<StdinMsg>) {
         b"\x1b[6n" => b"\x1b[1;1R",                  // CPR：光标位置
         b"\x1b[c" => b"\x1b[?1;0c",                  // DA1：VT100 级保守应答
         b"\x1b[>c" | b"\x1b[>0c" => b"\x1b[>0;10;1c", // DA2：次级设备属性
+        b"\x1b[?2026$p" => b"\x1b[?2026;2$y",        // DECRQM：同步输出模式
+        b"\x1b[?2048$p" => b"\x1b[?2048;0$y",        // DECRQM：备用屏保护
         _ => return,
     };
     macro_log::d!(
@@ -354,23 +356,25 @@ fn maybe_query_fallback(seq: &[u8], tx: &mpsc::Sender<StdinMsg>) {
 }
 
 /// OSC 查询兜底应答：vim 等通过 OSC 10/11 查询前后景颜色，未应答时程序以超时回退。
-fn maybe_osc_query_fallback(seq: &[u8], tx: &mpsc::Sender<StdinMsg>) {
-    // seq = ESC ] <内容> ST/BEL；查询内容形如 "10;?" / "11;?"
-    let body: &[u8] = if seq.ends_with(b"\x1b\\") {
-        &seq[2..seq.len() - 2]
-    } else {
-        &seq[2..seq.len() - 1]
-    };
-    let (num, color) = match body {
-        b"10;?" => (&b"10"[..], "ffff/ffff/ffff"), // 前景
-        b"11;?" => (&b"11"[..], "0000/0000/0000"), // 背景
-        _ => return,
-    };
-    let reply = format!("\x1b]{};rgb:{}\x1b\\", String::from_utf8_lossy(num), color);
+/// body 为 ESC] 与终结符之间的内容，支持批量查询（含多个 "10;?" / "11;?"），逐个应答。
+fn maybe_osc_query_fallback(body: &[u8], tx: &mpsc::Sender<StdinMsg>) {
+    if body.len() < 4 {
+        return;
+    }
+    let mut reply = String::new();
+    if body.windows(4).any(|w| w == b"10;?") {
+        reply.push_str("\x1b]10;rgb:ffff/ffff/ffff\x1b\\");
+    }
+    if body.windows(4).any(|w| w == b"11;?") {
+        reply.push_str("\x1b]11;rgb:0000/0000/0000\x1b\\");
+    }
+    if reply.is_empty() {
+        return;
+    }
     macro_log::d!(
         "[pty-query] 服务端检测到 OSC 查询 {}，立即兜底应答 {}",
-        crate::common::escape_bytes(seq),
-        crate::common::escape_bytes(reply.as_bytes())
+        crate::common::escape_bytes(body),
+        reply
     );
     let tx = tx.clone();
     tokio::spawn(async move {
@@ -387,10 +391,36 @@ enum ScanState {
     OscEsc,
 }
 
-/// PTY 会话：伪终端 + ANSI 原样透传（Windows ConPTY / Unix openpty）。
+/// 判定完整 CSI 序列是否为终端查询（服务端从输出流中丢弃并兜底应答）
+fn is_query_csi(seq: &[u8]) -> bool {
+    matches!(
+        seq,
+        b"\x1b[6n" | b"\x1b[?6n"                       // CPR
+        | b"\x1b[c" | b"\x1b[>c" | b"\x1b[>0c"          // DA1/DA2
+        | b"\x1b[?996n"                                 // 配色变化通知能力
+        | b"\x1b[14t" | b"\x1b[18t"                     // XTWINOPS 像素/单元格尺寸报告
+        | b"\x1b[>q"                                    // 光标形状查询
+        | b"\x1b[?u"                                    // kitty 键盘增强查询
+    ) || (seq.ends_with(b"$p") && seq.starts_with(b"\x1b[?")) // DECRQM 模式查询
+}
+
+/// 判定完整 OSC 序列是否为颜色查询。兼容批量发送（vim 将多条 OSC 查询共享一个终结符：
+/// `ESC]10;?ESC]11;?BEL`），内容中出现任一 "10;?" / "11;?" 即视为查询。
+fn contains_color_query(body: &[u8]) -> bool {
+    let pat10 = b"10;?";
+    let pat11 = b"11;?";
+    if body.len() < pat10.len() {
+        return false;
+    }
+    (0..=body.len() - pat10.len()).any(|i| &body[i..i + pat10.len()] == pat10)
+        || (0..=body.len() - pat11.len()).any(|i| &body[i..i + pat11.len()] == pat11)
+}
+
+/// PTY 会话：伪终端 + ANSI 透传（Windows ConPTY / Unix openpty）。
 /// 无 stdout/stderr 区分（stream="pty"）、无输出截断、无超时；客户端断连时 kill 子进程。
-/// 终端查询（CPR/DA1/DA2/OSC）由本端确定性兜底应答（见 maybe_query_fallback），其余输出原样透传；
-/// 客户端输入侧已过滤本地终端的应答回流，不会产生迟到的垃圾输入。
+/// 输出流中的终端查询（CPR/DA1/DA2/OSC/DECRQM/XTWINOPS/kitty）被丢弃并由本端确定性
+/// 兜底应答（见 maybe_query_fallback / maybe_osc_query_fallback），查询不透传到客户端终端，
+/// 从根本上避免宿主终端（WT/ConPTY）的应答回流远端造成乱码。
 async fn run_pty(
     req: ExecRequest,
     tx: mpsc::Sender<ExecEvent>,
@@ -517,7 +547,9 @@ async fn run_pty(
         }
     });
 
-    // 输出泵：原始字节原样透传（不转码、不截断）；嗅探 CPR/DA1/DA2/OSC 查询用于兜底应答。
+    // 输出泵：透传输出流，但**丢弃终端查询序列**（CPR/DA1/DA2/OSC 颜色/DECRQM/XTWINOPS
+    // 查询/kitty 键盘查询）并由本端确定性兜底应答。查询一旦透传到宿主终端（WT/ConPTY），
+    // 其应答会以按键形式回流远端造成乱码，且应答类型不可穷举，必须在源头拦截。
     let tx_reader = tx.clone();
     let cpr_tx = stdin_tx;
     let reader_task = tokio::task::spawn_blocking(move || {
@@ -525,11 +557,13 @@ async fn run_pty(
         let mut reader = reader;
         let mut buf = [0u8; 8192];
         let mut seq: Vec<u8> = Vec::new(); // 跨块收集的转义序列
+        let mut pass: Vec<u8> = Vec::with_capacity(buf.len()); // 每块非查询字节
         let mut scan = ScanState::Normal;
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
+                    pass.clear();
                     for &b in &buf[..n] {
                         match scan {
                             ScanState::Normal => {
@@ -537,40 +571,49 @@ async fn run_pty(
                                     seq.clear();
                                     seq.push(b);
                                     scan = ScanState::Esc;
+                                } else {
+                                    pass.push(b);
                                 }
                             }
-                            ScanState::Esc => match b {
-                                b'[' => {
-                                    seq.push(b);
-                                    scan = ScanState::Csi;
+                            ScanState::Esc => {
+                                seq.push(b);
+                                match b {
+                                    b'[' => scan = ScanState::Csi,
+                                    b']' => scan = ScanState::Osc,
+                                    0x1b => {
+                                        seq.clear();
+                                        seq.push(b);
+                                    }
+                                    _ => {
+                                        pass.extend_from_slice(&seq);
+                                        seq.clear();
+                                        scan = ScanState::Normal;
+                                    }
                                 }
-                                b']' => {
-                                    seq.push(b);
-                                    scan = ScanState::Osc;
-                                }
-                                0x1b => {
-                                    seq.clear();
-                                    seq.push(b);
-                                }
-                                _ => {
-                                    seq.clear();
-                                    scan = ScanState::Normal;
-                                }
-                            },
+                            }
                             ScanState::Csi => {
                                 seq.push(b);
                                 if (0x40..=0x7e).contains(&b) {
-                                    maybe_query_fallback(&seq, &cpr_tx);
+                                    if is_query_csi(&seq) {
+                                        macro_log::d!(
+                                            "[pty-query] 丢弃输出流查询 {} 并兜底应答",
+                                            crate::common::escape_bytes(&seq)
+                                        );
+                                        maybe_query_fallback(&seq, &cpr_tx);
+                                    } else {
+                                        pass.extend_from_slice(&seq);
+                                    }
                                     seq.clear();
                                     scan = ScanState::Normal;
                                 } else if seq.len() >= 32 {
+                                    pass.extend_from_slice(&seq);
                                     seq.clear(); // 异常序列，放弃
                                     scan = ScanState::Normal;
                                 }
                             }
                             ScanState::Osc => match b {
                                 0x07 => {
-                                    maybe_osc_query_fallback(&seq, &cpr_tx);
+                                    maybe_osc_query_fallback(&seq[2..seq.len() - 1], &cpr_tx);
                                     seq.clear();
                                     scan = ScanState::Normal;
                                 }
@@ -580,28 +623,41 @@ async fn run_pty(
                                 }
                                 _ => {
                                     seq.push(b);
-                                    if seq.len() >= 64 {
+                                    if seq.len() >= 128 {
+                                        pass.extend_from_slice(&seq);
                                         seq.clear(); // 异常序列，放弃
                                         scan = ScanState::Normal;
                                     }
                                 }
                             },
                             ScanState::OscEsc => {
-                                seq.push(b);
-                                if b == b'\\' {
-                                    maybe_osc_query_fallback(&seq, &cpr_tx);
-                                }
+                                // ESC 后非 '\\'：前一条 OSC 未终结（vim 批量查询共享终结符）
+                                // 先按无终结符处理已收集内容，再以当前 ESC 重新锚定新序列
+                                maybe_osc_query_fallback(&seq[2..], &cpr_tx);
                                 seq.clear();
-                                scan = ScanState::Normal;
+                                seq.push(0x1b);
+                                seq.push(b);
+                                match b {
+                                    b'[' => scan = ScanState::Csi,
+                                    b']' => scan = ScanState::Osc,
+                                    0x1b => scan = ScanState::Esc,
+                                    _ => {
+                                        pass.extend_from_slice(&seq);
+                                        seq.clear();
+                                        scan = ScanState::Normal;
+                                    }
+                                }
                             }
                         }
                     }
-                    let b64 = base64::engine::general_purpose::STANDARD.encode(&buf[..n]);
-                    if tx_reader
-                        .blocking_send(ExecEvent::Output { stream: "pty", data_b64: b64 })
-                        .is_err()
-                    {
-                        break;
+                    if !pass.is_empty() {
+                        let b64 = base64::engine::general_purpose::STANDARD.encode(&pass);
+                        if tx_reader
+                            .blocking_send(ExecEvent::Output { stream: "pty", data_b64: b64 })
+                            .is_err()
+                        {
+                            break;
+                        }
                     }
                 }
             }
@@ -638,6 +694,36 @@ async fn run_pty(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CPR/DA1/DA2/DECRQM 查询识别
+    #[test]
+    fn query_csi_detection() {
+        assert!(is_query_csi(b"\x1b[6n"));
+        assert!(is_query_csi(b"\x1b[?6n"));
+        assert!(is_query_csi(b"\x1b[c"));
+        assert!(is_query_csi(b"\x1b[>c"));
+        assert!(is_query_csi(b"\x1b[?996n"));
+        assert!(is_query_csi(b"\x1b[14t"));
+        assert!(is_query_csi(b"\x1b[18t"));
+        assert!(is_query_csi(b"\x1b[>q"));
+        assert!(is_query_csi(b"\x1b[?2026$p"));
+        assert!(is_query_csi(b"\x1b[?2048$p"));
+        // 非查询（输出命令）不得误判
+        assert!(!is_query_csi(b"\x1b[2J"));
+        assert!(!is_query_csi(b"\x1b[22;0;0t")); // 压栈标题命令
+        assert!(!is_query_csi(b"\x1b[38;2;17;1m"));
+        assert!(!is_query_csi(b"\x1b[?25h"));
+    }
+
+    /// OSC 颜色查询识别（含批量共享终结符）
+    #[test]
+    fn osc_query_detection() {
+        assert!(contains_color_query(b"10;?"));
+        assert!(contains_color_query(b"11;?"));
+        assert!(contains_color_query(b"10;?]11;?")); // vim 批量共享终结符
+        assert!(!contains_color_query(b"0;title"));
+        assert!(!contains_color_query(b"2;other"));
+    }
 
     /// CPR/DA1 查询应触发兜底应答，非查询序列不应答
     #[tokio::test]

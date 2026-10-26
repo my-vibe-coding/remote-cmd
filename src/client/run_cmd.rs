@@ -329,17 +329,15 @@ impl ReplyFilter {
                 }
                 FilterState::Naked => {
                     // 终结判定先于压入：pending[1..] 为已收集参数（不含当前字节）
-                    if (b == b'R' || b == b'c')
+                    if (b == b'R' || b == b'c' || b == b't' || b == b'y')
                         && self.pending.len() > 1
-                        && self.pending[1..].iter().all(|&c| {
-                            c.is_ascii_digit() || matches!(c, b';' | b'?' | b'>' | b'<' | b'=' | b':')
-                        })
+                        && is_reply_csi(b, &self.pending[1..])
                     {
-                        // 应答形状（如 [10;1R / [?1;0c / [>0;10;1c）：吞掉
+                        // 应答形状（如 [10;1R / [?1;0c / [>0;10;1c / [4;700;1450t / [?2026;2$y 不经此处）
                         self.pending.clear();
                         self.state = FilterState::Normal;
                     } else if b.is_ascii_digit()
-                        || matches!(b, b';' | b'?' | b'>' | b'<' | b'=' | b':')
+                        || matches!(b, b';' | b'?' | b'>' | b'<' | b'=' | b':' | b'$')
                     {
                         self.pending.push(b);
                         if self.pending.len() >= 32 {
@@ -418,20 +416,29 @@ impl ReplyFilter {
         out
     }
 
-    /// 判定已收集的完整 CSI 序列是否为终端应答（pending = ESC [ params... final）
+    /// 判定已收集的完整 CSI 序列是否为终端应答（pending = ESC [ params... final）。
+    /// 保险网：查询已在服务端输出流被丢弃，此处覆盖兜底漏网时的宿主终端应答形态。
     fn is_reply_sequence(&self) -> bool {
         let final_byte = *self.pending.last().unwrap();
         let params = &self.pending[2..self.pending.len() - 1];
-        let params_valid = params
-            .iter()
-            .all(|&b| b.is_ascii_digit() || matches!(b, b';' | b'?' | b'>' | b'<' | b'=' | b':'));
-        match final_byte {
-            // CPR 应答（ESC[1;1R）
-            b'R' => params_valid,
-            // DA 应答（ESC[?61;...c / DA2: ESC[>0;10;1c）
-            b'c' => params_valid,
-            _ => false,
-        }
+        is_reply_csi(final_byte, params)
+    }
+}
+
+/// 终端应答 CSI 形状判定（final + 参数）：CPR(R)/DA(c)/XTWINOPS 尺寸报告(t)/DECRQM 应答($y)
+fn is_reply_csi(final_byte: u8, params: &[u8]) -> bool {
+    if params.is_empty() {
+        return false;
+    }
+    match final_byte {
+        b'R' | b't' => params.iter().all(|&c| c.is_ascii_digit() || c == b';'),
+        b'c' => params.iter().all(|&c| {
+            c.is_ascii_digit() || matches!(c, b';' | b'?' | b'>' | b'<' | b'=' | b':')
+        }),
+        b'y' => params.iter().all(|&c| {
+            c.is_ascii_digit() || matches!(c, b';' | b'?' | b'$')
+        }),
+        _ => false,
     }
 }
 
