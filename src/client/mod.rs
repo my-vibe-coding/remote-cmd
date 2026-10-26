@@ -1,4 +1,5 @@
 pub mod config;
+pub mod dlog;
 pub mod remote;
 pub mod routes;
 pub mod run_cmd;

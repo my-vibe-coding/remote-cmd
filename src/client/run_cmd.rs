@@ -168,7 +168,7 @@ async fn run_pty_session(
             let msg = match a {
                 InputAction::Data(d) => match reply_filter.feed(&d) {
                     filtered if filtered.is_empty() && !d.is_empty() => {
-                        macro_log::d!(
+                        crate::dlog!(
                             "[pty-in] 客户端过滤器吞掉本地应答 {} 字节: {}",
                             d.len(),
                             crate::common::escape_bytes(&d)
@@ -177,7 +177,7 @@ async fn run_pty_session(
                     }
                     filtered => {
                         if !d.is_empty() {
-                            macro_log::d!(
+                            crate::dlog!(
                                 "[pty-in] 客户端输入 {} 字节 -> 转发 {} 字节: {}",
                                 d.len(),
                                 filtered.len(),
@@ -188,11 +188,11 @@ async fn run_pty_session(
                     }
                 },
                 InputAction::Resize(c, r) => {
-                    macro_log::d!("[pty-in] 客户端上报终端尺寸 {}x{}", c, r);
+                    crate::dlog!("[pty-in] 客户端上报终端尺寸 {}x{}", c, r);
                     resize_msg(c, r)
                 }
                 InputAction::Detach => {
-                    macro_log::d!("[pty-in] 客户端脱离会话（Ctrl+]）");
+                    crate::dlog!("[pty-in] 客户端脱离会话（Ctrl+]）");
                     let _ = detach_tx.send(()).await;
                     break;
                 }
@@ -216,7 +216,7 @@ async fn run_pty_session(
                 Some(Ok(frame)) => match parse_frame(frame) {
                     Some(ExecFrame::Output { data, .. }) => {
                         if crate::common::looks_like_query(&data) {
-                            macro_log::d!(
+                            crate::dlog!(
                                 "[pty-out] 客户端收到远端查询 {} 字节: {}",
                                 data.len(),
                                 crate::common::escape_bytes(&data)
