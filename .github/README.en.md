@@ -10,8 +10,9 @@ A single-binary remote command execution tool: the server provides an HTTPS admi
 - **HTTPS everywhere**: a self-signed certificate is generated automatically on first start (rustls), no extra configuration
 - **Approval-based registration**: clients can only execute commands after being approved in the admin console
 - **Command whitelist**: the server only runs programs on the whitelist, arbitrary commands are rejected
-- **Live output**: SSE-based streaming, output is rendered line by line in real time with exit codes preserved
-- **Aliases with templates**: an alias maps to a command template (e.g. `git add {args}`) with transparent argument passing
+- **Live output**: WebSocket-based full-duplex streaming with real-time output rendering, exit codes preserved, stdin forwarding and PTY resize
+- **Interactive PTY sessions**: run interactive programs (bash/tmux/vim/REPL) remotely; the server handles terminal query/reply sequences so no reply garbage ever leaks
+- **Aliases with templates**: an alias maps to a command template (e.g. `git add {args}`) with transparent argument passing, bindable to any registered server
 - **Executable script shims**: generate a script per alias into the bin directory so it can be invoked from any terminal; Ctrl+C terminates directly with no confirmation prompt
 - **Audit log**: every execution is recorded and traceable
 - **Public address display**: the server fetches its public IPv4 via ipv4.ip.sb on startup for convenient external access
@@ -99,8 +100,8 @@ Pushing a `v*` tag triggers GitHub Actions to build Windows and Alpine (musl) ar
 
 ## Tech Stack
 
-- Backend: Rust · axum · rustls(ring) · SSE · Vue 3 + Vite (embedded)
-- Windows-native capabilities: `SHOpenFolderAndSelectItems` (reveal in Explorer), OEM code page decoding (no mojibake for Chinese output)
+- Backend: Rust · tokio · axum · rustls(ring) · WebSocket · portable-pty · Vue 3 + Vite (embedded)
+- Windows-native capabilities: `SHOpenFolderAndSelectItems` (reveal in Explorer), ConPTY pseudo-terminal, OEM code page decoding (no mojibake for Chinese output)
 
 ## License
 

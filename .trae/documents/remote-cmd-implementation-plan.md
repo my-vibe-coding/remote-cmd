@@ -130,3 +130,31 @@ build.rs              # rerun-if-changed=web/dist
 4. 配置白名单 `["ping"]` → `curl -k -N -X POST .../api/exec -H "X-Client-Token: ..."` → 逐行 SSE 输出 + exit 事件；非白名单 → 403
 5. 客户端页建别名 → 生成 bat → `remote-cmd run <别名>` 流式输出且 ERRORLEVEL 透传
 6. 安全用例：错误密码 5 次 → 429；无 token → 401；吊销后 → 401；审计页可见全部事件
+
+---
+
+## 附：架构演进现状（本文档为初始 MVP 计划，以下为实施后的演进记录）
+
+初始计划已全部实施并通过端到端验证。此后经历两轮大演进，**当前架构与上文若干描述已不同**，以本节为准：
+
+### 演进 1：执行链路迁移 WebSocket 全双工（已实施，见 [stdin-implementation-plan.md](stdin-implementation-plan.md)）
+
+- `POST /api/exec`（SSE）→ `GET /api/exec/ws`（WS）：init/started/rejected 握手，0x01/0x02 输出帧，Exit JSON 终态帧
+- 新增 stdin 双泵（管道转发 / TTY 行模式 `-i`）、PTY resize、断连 kill
+- 浏览器 ↔ 本地客户端仍为 HTTP+SSE 代理形态（Run.vue 零改动），本地客户端 ↔ 服务端走 WS
+
+### 演进 2：PTY 交互会话与终端查询治理
+
+- **PTY 交互会话**：`tty: true` 请求走 portable-pty + raw mode，支持交互式程序（bash/tmux/vim/REPL），Ctrl+] 脱离，客户端随 init 帧上报终端尺寸
+- **终端查询/应答治理**（详见 [terminal-query-handling.md](terminal-query-handling.md)）：
+  - 服务端输出泵 `ScanState` 从输出流**丢弃查询序列**并**立即确定性兜底应答**（根治层）
+  - 客户端 `ReplyFilter` 过滤 stdin 方向的应答残余（保险网）
+
+### 其他实施后新增/变更
+
+- **exe shim 脚本**：别名脚本从 `.bat` 演进为主程序副本（`shim_alias` 拦截），启动时自动刷新过期副本（`refresh_scripts`）
+- **多服务器注册**：客户端 `ServerReg` 支持注册多个服务端，别名可绑定指定服务器（默认服务器兜底）
+- **客户端 Host 白名单中间件**：本地页面防 DNS rebinding
+- **Windows OEM 转码**：管道模式输出按首块 UTF-8 校验判定编码，GBK 等legacy 代码页统一转 UTF-8（`OutputTranscoder`）
+- **安全加固**：rustls 显式 ring provider、argon2 密码哈希、注册/登录限流、审计 jsonl、原子写 persist 重试兜底
+- **客户端文件日志**：`dlog!` 宏（file!/line!/时间戳）写 `client/debug.log`——PTY 场景 stdout 即终端流，禁止向 stdout 打日志

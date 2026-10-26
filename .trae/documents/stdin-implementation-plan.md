@@ -1,5 +1,7 @@
 # remote-cmd 实施计划：远程执行 stdin 输入（WebSocket 全双工）
 
+> **状态：已实施完成**。执行链路已整体迁移到 WebSocket 全双工（`GET /api/exec/ws`），SSE 执行端点已删除。本文档保留为设计与实施过程记录，当前架构见 [remote-cmd-implementation-plan.md](remote-cmd-implementation-plan.md) 附录。
+
 ## Context
 
 当前执行链路为服务端到客户端的单向 SSE 输出流：

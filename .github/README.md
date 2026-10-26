@@ -10,8 +10,9 @@
 - **HTTPS 全程加密**：首次启动自动生成自签名证书（rustls），无需额外配置
 - **注册审批制**：客户端需在管理后台审批通过后才能执行命令
 - **命令白名单**：服务端只执行白名单内的程序，拒绝任意命令
-- **实时输出**：基于 SSE 的流式回传，输出逐行实时展示，保留退出码
-- **别名与模板**：别名绑定命令模板（如 `git add {args}`），支持参数透传
+- **实时输出**：基于 WebSocket 全双工的流式回传，输出实时展示、保留退出码，支持 stdin 交互与 PTY resize
+- **PTY 交互会话**：支持交互式程序（bash/tmux/vim/REPL）远程操作，服务端自动处理终端查询/应答，杜绝应答乱码
+- **别名与模板**：别名绑定命令模板（如 `git add {args}`），支持参数透传，可绑定到多个已注册服务器
 - **可执行脚本 shim**：一键为别名生成可执行脚本到 bin 目录，任意终端直接调用；Ctrl+C 直接终止、无确认提示
 - **审计日志**：所有执行记录可追溯
 - **公网地址展示**：服务端启动时自动通过 ipv4.ip.sb 获取公网 IP，便于外部访问
@@ -99,8 +100,8 @@ cargo build --release
 
 ## 技术栈
 
-- 后端：Rust · axum · rustls(ring) · SSE · Vue 3 + Vite（嵌入）
-- Windows 原生能力：`SHOpenFolderAndSelectItems`（资源管理器定位）、OEM 代码页解码（中文输出不乱码）
+- 后端：Rust · tokio · axum · rustls(ring) · WebSocket · portable-pty · Vue 3 + Vite（嵌入）
+- Windows 原生能力：`SHOpenFolderAndSelectItems`（资源管理器定位）、ConPTY 伪终端、OEM 代码页解码（中文输出不乱码）
 
 ## License
 
