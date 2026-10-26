@@ -66,13 +66,19 @@ pub async fn serve(port: u16, password: Option<String>, data_dir: Option<String>
     let app = routes::router(state);
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
-    let host = crate::common::net::fetch_public_ipv4().await.unwrap_or("127.0.0.1".to_string());
-    macro_log::i!("remote-cmd 服务端已启动: https://{host}:{port}");
-    macro_log::i!("管理页面: https://{host}:{port}/admin");
+    macro_log::i!("remote-cmd 服务端监听: {addr}");
+    macro_log::i!("管理页面: https://127.0.0.1:{port}/admin");
     if let Some(pwd) = printed_password {
         macro_log::i!("（首次启动，请记录上方自动生成的管理员密码）");
         let _ = pwd;
     }
+
+    // 公网地址后台获取（最多 5s 外部请求），不阻塞监听启动
+    tokio::spawn(async move {
+        if let Some(ip) = crate::common::net::fetch_public_ipv4().await {
+            macro_log::i!("公网地址（需端口可达）: https://{ip}:{port}/admin");
+        }
+    });
 
     axum_server::bind_rustls(addr, tls_config)
         .serve(app.into_make_service_with_connect_info::<std::net::SocketAddr>())

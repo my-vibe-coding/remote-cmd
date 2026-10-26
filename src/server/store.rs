@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
-use crate::common::json_file::{append_jsonl, load_json, load_jsonl, save_json_atomic};
+use crate::common::json_file::{append_jsonl, load_json, save_json_atomic};
 use crate::common::AppResult;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,8 +92,9 @@ impl Store {
     }
 
     pub fn save(&self) -> AppResult<()> {
-        let clients = self.clients.lock().unwrap();
-        save_json_atomic(&self.clients_file(), &*clients)
+        // 先克隆释放锁，再做同步文件 IO（避免持锁期间阻塞其他 store 操作与 tokio worker）
+        let snapshot = self.clients.lock().unwrap().clone();
+        save_json_atomic(&self.clients_file(), &snapshot)
     }
 
     /// 按指纹查找注册记录（同一指纹仅一条）
@@ -215,5 +216,33 @@ impl Audit {
 }
 
 fn query_jsonl_tail<T: serde::de::DeserializeOwned>(path: &Path, limit: usize) -> Vec<T> {
-    load_jsonl::<T>(path).unwrap_or_default().into_iter().rev().take(limit).collect()
+    // 只读文件尾部（每行按 ~2KB 估算，上限 2MB），避免日志增长后全量加载
+    let limit = limit.min(1000);
+    let Ok(meta) = std::fs::metadata(path) else {
+        return vec![];
+    };
+    let read_len = meta.len().min((limit as u64 * 2048).min(2 * 1024 * 1024)) as usize;
+    let Ok(file) = std::fs::File::open(path) else {
+        return vec![];
+    };
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::io::BufReader::new(file);
+    if file.seek(SeekFrom::End(-(read_len as i64))).is_err() {
+        return vec![];
+    }
+    let mut buf = String::new();
+    if file.read_to_string(&mut buf).is_err() {
+        return vec![];
+    }
+    // 尾部读取可能从某行中间开始：丢弃第一个不完整行
+    let lines: Vec<&str> = buf.lines().skip(1).collect();
+    lines
+        .into_iter()
+        .rev()
+        .filter_map(|line| {
+            let line = line.trim();
+            (!line.is_empty()).then(|| serde_json::from_str(line).ok()).flatten()
+        })
+        .take(limit)
+        .collect()
 }
