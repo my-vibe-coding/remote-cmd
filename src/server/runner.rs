@@ -328,14 +328,15 @@ pub fn whitelist_matches(whitelist: &[String], program: &str) -> bool {
     whitelist.iter().any(|entry| entry.trim().to_lowercase() == name)
 }
 
-/// 查询兜底应答：远端程序的终端查询（CPR/DA1）由服务端确定性应答。
+/// 查询兜底应答：远端程序的终端查询（CPR/DA1/DA2）由服务端确定性应答。
 /// 客户端已在输入侧过滤本地终端的应答回流（ConPTY 会抢答且时序不可控，透传必然
 /// 产生迟到的垃圾输入），因此兜底是远端查询的唯一应答来源；同时覆盖服务端侧
 /// ConPTY 的启动握手（Windows 服务端下 ConPTY 会向宿主终端发 ESC[6n，不应答会卡死会话）。
 fn maybe_query_fallback(seq: &[u8], tx: &mpsc::Sender<StdinMsg>) {
     let reply: &[u8] = match seq {
-        b"\x1b[6n" => b"\x1b[1;1R", // CPR：光标位置
-        b"\x1b[c" => b"\x1b[?1;0c", // DA1：VT100 级保守应答
+        b"\x1b[6n" => b"\x1b[1;1R",                  // CPR：光标位置
+        b"\x1b[c" => b"\x1b[?1;0c",                  // DA1：VT100 级保守应答
+        b"\x1b[>c" | b"\x1b[>0c" => b"\x1b[>0;10;1c", // DA2：次级设备属性
         _ => return,
     };
     let tx = tx.clone();
@@ -345,9 +346,39 @@ fn maybe_query_fallback(seq: &[u8], tx: &mpsc::Sender<StdinMsg>) {
     });
 }
 
+/// OSC 查询兜底应答：vim 等通过 OSC 10/11 查询前后景颜色，未应答时程序以超时回退。
+fn maybe_osc_query_fallback(seq: &[u8], tx: &mpsc::Sender<StdinMsg>) {
+    // seq = ESC ] <内容> ST/BEL；查询内容形如 "10;?" / "11;?"
+    let body: &[u8] = if seq.ends_with(b"\x1b\\") {
+        &seq[2..seq.len() - 2]
+    } else {
+        &seq[2..seq.len() - 1]
+    };
+    let (num, color) = match body {
+        b"10;?" => (&b"10"[..], "ffff/ffff/ffff"), // 前景
+        b"11;?" => (&b"11"[..], "0000/0000/0000"), // 背景
+        _ => return,
+    };
+    let reply = format!("\x1b]{};rgb:{}\x1b\\", String::from_utf8_lossy(num), color);
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let _ = tx.send(StdinMsg::Data(reply.into_bytes())).await;
+    });
+}
+
+/// 输出扫描状态机：识别 CSI（ESC[）与 OSC（ESC]）序列用于查询兜底
+enum ScanState {
+    Normal,
+    Esc,
+    Csi,
+    Osc,
+    OscEsc,
+}
+
 /// PTY 会话：伪终端 + ANSI 原样透传（Windows ConPTY / Unix openpty）。
 /// 无 stdout/stderr 区分（stream="pty"）、无输出截断、无超时；客户端断连时 kill 子进程。
-/// 终端查询（CPR/DA1）由本端确定性兜底应答（见 maybe_query_fallback），其余输出原样透传；
+/// 终端查询（CPR/DA1/DA2/OSC）由本端确定性兜底应答（见 maybe_query_fallback），其余输出原样透传；
 /// 客户端输入侧已过滤本地终端的应答回流，不会产生迟到的垃圾输入。
 async fn run_pty(
     req: ExecRequest,
@@ -465,39 +496,82 @@ async fn run_pty(
         }
     });
 
-    // 输出泵：原始字节原样透传（不转码、不截断）；嗅探 CPR/DA1 查询用于兜底应答。
+    // 输出泵：原始字节原样透传（不转码、不截断）；嗅探 CPR/DA1/DA2/OSC 查询用于兜底应答。
     let tx_reader = tx.clone();
     let cpr_tx = stdin_tx;
     let reader_task = tokio::task::spawn_blocking(move || {
         use std::io::Read as _;
         let mut reader = reader;
         let mut buf = [0u8; 8192];
-        let mut seq: Vec<u8> = Vec::new(); // 跨块收集的 CSI 序列
+        let mut seq: Vec<u8> = Vec::new(); // 跨块收集的转义序列
+        let mut scan = ScanState::Normal;
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     for &b in &buf[..n] {
-                        if seq.is_empty() {
-                            if b == 0x1b {
-                                seq.push(b);
-                            }
-                        } else if seq.len() == 1 {
-                            if b == b'[' {
-                                seq.push(b);
-                            } else {
-                                seq.clear();
+                        match scan {
+                            ScanState::Normal => {
                                 if b == 0x1b {
+                                    seq.clear();
                                     seq.push(b);
+                                    scan = ScanState::Esc;
                                 }
                             }
-                        } else {
-                            seq.push(b);
-                            if (0x40..=0x7e).contains(&b) {
-                                maybe_query_fallback(&seq, &cpr_tx);
+                            ScanState::Esc => match b {
+                                b'[' => {
+                                    seq.push(b);
+                                    scan = ScanState::Csi;
+                                }
+                                b']' => {
+                                    seq.push(b);
+                                    scan = ScanState::Osc;
+                                }
+                                0x1b => {
+                                    seq.clear();
+                                    seq.push(b);
+                                }
+                                _ => {
+                                    seq.clear();
+                                    scan = ScanState::Normal;
+                                }
+                            },
+                            ScanState::Csi => {
+                                seq.push(b);
+                                if (0x40..=0x7e).contains(&b) {
+                                    maybe_query_fallback(&seq, &cpr_tx);
+                                    seq.clear();
+                                    scan = ScanState::Normal;
+                                } else if seq.len() >= 32 {
+                                    seq.clear(); // 异常序列，放弃
+                                    scan = ScanState::Normal;
+                                }
+                            }
+                            ScanState::Osc => match b {
+                                0x07 => {
+                                    maybe_osc_query_fallback(&seq, &cpr_tx);
+                                    seq.clear();
+                                    scan = ScanState::Normal;
+                                }
+                                0x1b => {
+                                    seq.push(b);
+                                    scan = ScanState::OscEsc;
+                                }
+                                _ => {
+                                    seq.push(b);
+                                    if seq.len() >= 64 {
+                                        seq.clear(); // 异常序列，放弃
+                                        scan = ScanState::Normal;
+                                    }
+                                }
+                            },
+                            ScanState::OscEsc => {
+                                seq.push(b);
+                                if b == b'\\' {
+                                    maybe_osc_query_fallback(&seq, &cpr_tx);
+                                }
                                 seq.clear();
-                            } else if seq.len() >= 32 {
-                                seq.clear(); // 异常序列，放弃
+                                scan = ScanState::Normal;
                             }
                         }
                     }

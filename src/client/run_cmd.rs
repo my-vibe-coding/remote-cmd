@@ -363,11 +363,11 @@ impl ReplyFilter {
         let params = &self.pending[2..self.pending.len() - 1];
         let params_valid = params
             .iter()
-            .all(|&b| b.is_ascii_digit() || b == b';' || b == b'?');
+            .all(|&b| b.is_ascii_digit() || matches!(b, b';' | b'?' | b'>' | b'<' | b'=' | b':'));
         match final_byte {
             // CPR 应答（ESC[1;1R）
             b'R' => params_valid,
-            // DA 应答（ESC[?61;...c）
+            // DA 应答（ESC[?61;...c / DA2: ESC[>0;10;1c）
             b'c' => params_valid,
             _ => false,
         }
@@ -481,6 +481,15 @@ mod tests {
         let mut f = ReplyFilter::new();
         let da = b"\x1b[?61;4;6;7;14;21;22;23;24;28;32;42;52c";
         assert_eq!(f.feed(da), b"");
+    }
+
+    /// DA2 应答（参数含 >）应被吞掉
+    #[test]
+    fn reply_filter_swallows_da2_reply() {
+        let mut f = ReplyFilter::new();
+        assert_eq!(f.feed(b"\x1b[>0;10;1c"), b"");
+        let mut f = ReplyFilter::new();
+        assert_eq!(f.feed(b"\x1b[>c"), b""); // 部分终端的 DA2 应答
     }
 
     /// OSC 应答（BEL / ST 终结）应被吞掉
