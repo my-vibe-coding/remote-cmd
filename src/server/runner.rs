@@ -512,13 +512,26 @@ async fn run_pty(
     };
     let master = Arc::new(std::sync::Mutex::new(pair.master));
 
-    // stdin writer 任务（异步）：Data → spawn_blocking 写入 PTY 主端；Resize → 调整尺寸；
-    // stdin 通道关闭或会话结束（tx.closed）→ 退出 → master 释放 → ConPTY 关闭 → 输出泵 EOF
+    // stdin 转发：专用阻塞写线程独占 PTY 写端（消除逐键 spawn_blocking 与双层锁竞争），
+    // 异步任务经有界 std 通道投递；通道满（PTY 消费不动）时轮询让出执行权，不阻塞运行时线程。
     let writer_master = Arc::clone(&master);
     let tx_writer = tx.clone();
+    let (wtx, wrx) = std::sync::mpsc::sync_channel::<Vec<u8>>(32);
     let _writer_task = tokio::spawn(async move {
-        let writer = writer_master.lock().unwrap().take_writer().ok();
-        let writer = Arc::new(std::sync::Mutex::new(writer));
+        // 预取写端：此后写线程独占持有，无锁
+        let taken = writer_master
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take_writer()
+            .ok();
+        let write_thread = std::thread::spawn(move || {
+            let Some(mut w) = taken else { return; };
+            while let Ok(data) = wrx.recv() {
+                if w.write_all(&data).and_then(|_| w.flush()).is_err() {
+                    break;
+                }
+            }
+        });
         let mut closed = std::pin::pin!(tx_writer.closed());
         loop {
             let msg = tokio::select! {
@@ -535,29 +548,33 @@ async fn run_pty(
                         data.len(),
                         crate::common::escape_bytes(&data)
                     );
-                    let w = Arc::clone(&writer);
-                    let res = tokio::task::spawn_blocking(move || {
-                        if let Some(w) = w.lock().unwrap().as_mut() {
-                            w.write_all(&data).and_then(|_| w.flush())
-                        } else {
-                            Ok(())
+                    // 背压：写线程消费不动时让出重试（try_send 失败归还数据）
+                    let mut data = data;
+                    let delivered = loop {
+                        match wtx.try_send(data) {
+                            Ok(()) => break true,
+                            Err(std::sync::mpsc::TrySendError::Full(d)) => {
+                                data = d;
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => break false, // 写线程已退出（PTY 写失败）
                         }
-                    })
-                    .await;
-                    match res {
-                        Ok(Ok(())) => {}
-                        _ => break,
+                    };
+                    if !delivered {
+                        break;
                     }
                 }
                 StdinMsg::Eof => break,
                 StdinMsg::Resize { cols, rows } => {
                     let _ = writer_master
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(|e| e.into_inner())
                         .resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 });
                 }
             }
         }
+        drop(wtx); // 通知写线程退出
+        let _ = write_thread.join();
     });
 
     // 输出泵：透传输出流，但**丢弃终端查询序列**（CPR/DA1/DA2/OSC 颜色/DECRQM/XTWINOPS
