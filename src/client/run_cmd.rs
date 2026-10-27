@@ -31,6 +31,7 @@ pub async fn run(alias: &str, args: &[String]) -> Result<()> {
         None,
         pty,
         tty_size,
+        server.cert_sha256.as_deref(),
     )
     .await
     {

@@ -90,10 +90,23 @@ async fn register_to_server(
     let token = resp["token"].as_str().map(|s| s.to_string());
     let registered = token.is_some();
 
+    // 采集服务端证书指纹（TOFU 信任锚）：后续 WS 连接强校验，防中间人窃取凭证。
+    // 采集失败不阻断注册（旧配置兼容：指纹为 None 时连接放行）。
+    let cert_sha256 = match crate::client::remote::probe_cert_sha256(&server_url).await {
+        Ok(pin) => Some(pin),
+        Err(e) => {
+            macro_log::w!("采集服务端证书指纹失败: {e}");
+            None
+        }
+    };
+
     if let Some(existing) = config.servers.iter_mut().find(|s| s.server_url == server_url) {
         existing.client_id = client_id;
         existing.token = token;
         existing.registered = registered;
+        if cert_sha256.is_some() {
+            existing.cert_sha256 = cert_sha256;
+        }
     } else {
         config.servers.push(ServerReg {
             server_url: server_url.clone(),
@@ -101,6 +114,7 @@ async fn register_to_server(
             hostname: info.hostname.clone(),
             token: token.clone(),
             registered,
+            cert_sha256,
         });
     }
     config.save().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
@@ -379,9 +393,18 @@ async fn exec(Json(body): Json<ExecBody>) -> Result<Response, (StatusCode, Strin
     let program = payload["program"].as_str().unwrap_or_default().to_string();
     let args: Vec<String> = serde_json::from_value(payload["args"].clone())
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let mut ws = crate::client::remote::ws_exec(&server.server_url, &token, &program, &args, None, false, None)
-        .await
-        .map_err(|e| (StatusCode::BAD_GATEWAY, format!("执行请求失败: {e}")))?;
+    let mut ws = crate::client::remote::ws_exec(
+        &server.server_url,
+        &token,
+        &program,
+        &args,
+        None,
+        false,
+        None,
+        server.cert_sha256.as_deref(),
+    )
+    .await
+    .map_err(|e| (StatusCode::BAD_GATEWAY, format!("执行请求失败: {e}")))?;
 
     // Web 页无 stdin 交互：立即 EOF
     let _ = ws.sink.send(WsMessage::Text(crate::client::remote::STDIN_CLOSE.into())).await;

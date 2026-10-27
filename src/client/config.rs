@@ -18,6 +18,10 @@ pub struct ServerReg {
     pub token: Option<String>,
     #[serde(default)]
     pub registered: bool,
+    /// 服务端证书 SHA256 指纹（hex，注册时首次接触采集，TOFU 信任锚）。
+    /// 后续 WS 连接强校验，防中间人窃取凭证；None 时放行（兼容旧配置）。
+    #[serde(default)]
+    pub cert_sha256: Option<String>,
 }
 
 /// 客户端配置：%USERPROFILE%\.remote-cmd\client\client.json
@@ -53,6 +57,7 @@ impl ClientConfig {
                 hostname: cfg.hostname.clone(),
                 token: cfg.token.clone(),
                 registered: cfg.registered,
+                cert_sha256: None,
             });
             cfg.server_url.clear();
             cfg.client_id.clear();
