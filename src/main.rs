@@ -19,7 +19,7 @@ async fn main() -> anyhow::Result<()> {
     // 必须在 clap 解析之前拦截，避免别名参数被误认为选项
     if let Some(alias) = client::script::shim_alias() {
         let args: Vec<String> = std::env::args().skip(1).collect();
-        let res = client::run_cmd::run(&alias, &args).await;
+        let res = client::run_cmd::run(&alias, &args, false).await;
         if let Err(e) = &res {
             crate::dlog!("[main] shim run 失败: {e:#}");
         }
@@ -34,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
             data_dir,
         }) => server::serve(port, password, data_dir).await,
         Some(cli::Command::Run { alias, args }) => {
-            let res = client::run_cmd::run(&alias, &args).await;
+            let res = client::run_cmd::run(&alias, &args, true).await;
             if let Err(e) = &res {
                 crate::dlog!("[main] run 失败: {e:#}");
             }

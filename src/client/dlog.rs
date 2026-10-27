@@ -2,20 +2,28 @@
 //!
 //! 不能用 macro_log::d!：其底层走 stdout 打印，而 PTY 会话的 stdout 就是终端本身，
 //! 日志会混入远端输出污染画面。本模块将日志追加写入客户端数据目录下的 debug.log。
+//! 仅 debug 构建生效；release 构建下 dlog! 展开为空操作、落盘代码不参与编译。
 
+#[cfg(debug_assertions)]
 use std::fs::{File, OpenOptions};
+#[cfg(debug_assertions)]
 use std::io::Write;
+#[cfg(debug_assertions)]
 use std::path::PathBuf;
+#[cfg(debug_assertions)]
 use std::sync::{Mutex, OnceLock};
 
 /// 日志文件大小上限：超过则重建（防无限增长）
+#[cfg(debug_assertions)]
 const MAX_LOG_BYTES: u64 = 8 * 1024 * 1024;
 
+#[cfg(debug_assertions)]
 fn sink() -> &'static Mutex<Option<File>> {
     static SINK: OnceLock<Mutex<Option<File>>> = OnceLock::new();
     SINK.get_or_init(|| Mutex::new(open_log()))
 }
 
+#[cfg(debug_assertions)]
 fn open_log() -> Option<File> {
     let path = log_path();
     if let Some(dir) = path.parent() {
@@ -35,12 +43,14 @@ fn open_log() -> Option<File> {
 }
 
 /// 日志文件路径：%USERPROFILE%\.remote-cmd\client\debug.log
+#[cfg(debug_assertions)]
 pub fn log_path() -> PathBuf {
     crate::common::paths::client_data_dir().join("debug.log")
 }
 
 /// 追加一条日志（由 dlog! 宏调用，自带 file!/line! 定位信息）。
 /// 打开失败（如文件被编辑器短暂锁定）时下次调用自动重试，不缓存失败状态。
+#[cfg(debug_assertions)]
 pub fn write(file: &str, line: u32, args: std::fmt::Arguments<'_>) {
     let cell = sink();
     let Ok(mut guard) = cell.lock() else { return };
@@ -61,10 +71,34 @@ pub fn write(file: &str, line: u32, args: std::fmt::Arguments<'_>) {
     }
 }
 
-/// 客户端调试日志宏：写入 client 目录下 debug.log（不影响终端输出流）
+/// 客户端调试日志宏：debug 构建写入 client 目录下 debug.log（不影响终端输出流），release 构建为空操作。
+#[cfg(debug_assertions)]
 #[macro_export]
 macro_rules! dlog {
     ($($arg: tt)+) => {
         $crate::client::dlog::write(file!(), line!(), format_args!($($arg)+))
+    };
+}
+
+/// release 构建：不落盘。保留 format_args! 求值，使参数表达式仍算"被使用"，避免未用变量告警。
+#[cfg(not(debug_assertions))]
+#[macro_export]
+macro_rules! dlog {
+    ($($arg: tt)+) => {
+        {{
+            let _ = format_args!($($arg)+);
+        }}
+    };
+}
+
+/// 客户端 stderr 提示宏：首参为 verbose 开关（别名 shim 模式传 false）。
+/// 关闭时不打印——shim 是以别名命名的 exe 副本，常被脚本包装调用，
+/// 本工具的提示信息混入 stderr 会污染调用方的输出处理。
+#[macro_export]
+macro_rules! verbose {
+    ($on: expr, $($arg: tt)+) => {
+        if $on {
+            eprintln!($($arg)+);
+        }
     };
 }

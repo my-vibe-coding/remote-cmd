@@ -12,8 +12,9 @@ use super::remote::{parse_frame, resize_msg, trace_frame, ws_exec, ExecFrame, Ex
 /// WS 心跳间隔：空闲会话周期发 Ping，防 NAT/代理静默掐断长连接
 const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// `remote-cmd run <别名> [args...]`：读取本地配置 → 模板渲染 → WS 会话 → stdin 转发 + 流式输出 → 透传退出码
-pub async fn run(alias: &str, args: &[String]) -> Result<()> {
+/// `remote-cmd run <别名> [args...]`：读取本地配置 → 模板渲染 → WS 会话 → stdin 转发 + 流式输出 → 透传退出码。
+/// `verbose=false`（别名 shim 模式）时抑制 stderr 提示信息，避免污染包装脚本的输出处理。
+pub async fn run(alias: &str, args: &[String], verbose: bool) -> Result<()> {
     let (server, body) = resolve_exec_target(alias, args)?;
     let program = body["program"].as_str().unwrap_or_default().to_string();
     let cmd_args: Vec<String> = serde_json::from_value(body["args"].clone())?;
@@ -40,7 +41,7 @@ pub async fn run(alias: &str, args: &[String]) -> Result<()> {
     };
 
     if pty {
-        return run_pty_session(sink, stream).await;
+        return run_pty_session(sink, stream, verbose).await;
     }
 
     // 管道 stdin → 转发原始字节，EOF 时发 stdin_close
@@ -68,7 +69,7 @@ pub async fn run(alias: &str, args: &[String]) -> Result<()> {
                     Some(ExecFrame::Exit { exit_code: code, timeout, .. }) => {
                         crate::dlog!("[run] 收到 Exit 终态 exit_code={code:?} timeout={timeout}");
                         if timeout {
-                            eprintln!("[remote-cmd] 远程命令执行超时");
+                            crate::verbose!(verbose, "[remote-cmd] 远程命令执行超时");
                         }
                         exit_code = code;
                         break;
@@ -82,7 +83,7 @@ pub async fn run(alias: &str, args: &[String]) -> Result<()> {
             }
             Err(e) => {
                 crate::dlog!("[run] WS 连接错误: {e}");
-                eprintln!("[remote-cmd] 连接中断: {e}");
+                crate::verbose!(verbose, "[remote-cmd] 连接中断: {e}");
                 break;
             }
         }
@@ -101,7 +102,7 @@ pub async fn run(alias: &str, args: &[String]) -> Result<()> {
         None => {
             // 进程被 kill / 启动失败 / 连接中断
             crate::dlog!("[run] 进程异常退出（无 Exit 终态），exit 1");
-            eprintln!("[remote-cmd] 远程命令异常退出");
+            crate::verbose!(verbose, "[remote-cmd] 远程命令异常退出");
             std::process::exit(1);
         }
     }
@@ -159,6 +160,7 @@ fn spawn_stdin_pump(
 async fn run_pty_session(
     mut sink: futures::stream::SplitSink<super::remote::WsStream, WsMessage>,
     mut stream: futures::stream::SplitStream<super::remote::WsStream>,
+    verbose: bool,
 ) -> Result<()> {
     use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 
@@ -293,7 +295,7 @@ async fn run_pty_session(
                 }
                 Some(Err(e)) => {
                     crate::dlog!("[pty] WS 连接错误: {e}");
-                    eprintln!("[remote-cmd] 连接中断: {e}");
+                    crate::verbose!(verbose, "[remote-cmd] 连接中断: {e}");
                     break;
                 }
                 None => {
@@ -314,7 +316,7 @@ async fn run_pty_session(
     drop(_raw); // 避免 Drop 重复 disable（disable 幂等，仅语义清晰）
 
     if detached {
-        eprintln!("[remote-cmd] 已脱离会话，远端进程将被终止");
+        crate::verbose!(verbose, "[remote-cmd] 已脱离会话，远端进程将被终止");
         std::process::exit(0); // 不经 Drop（已手动恢复终端），立即断开
     }
 
@@ -323,12 +325,12 @@ async fn run_pty_session(
             crate::dlog!("[pty] 进程退出 exit_code={code}");
             // 交互会话：远端退出（含容器重启杀 exec 等场景）必须给出可见提示，
             // 否则表现为"无任何提示的自动退出"（退出码本身仍透传）
-            eprintln!("[remote-cmd] 远程会话已结束，退出码 {code}");
+            crate::verbose!(verbose, "[remote-cmd] 远程会话已结束，退出码 {code}");
             std::process::exit(code)
         }
         None => {
             crate::dlog!("[pty] 进程异常退出（无 Exit 终态），exit 1");
-            eprintln!("[remote-cmd] 远程命令异常退出");
+            crate::verbose!(verbose, "[remote-cmd] 远程命令异常退出");
             std::process::exit(1);
         }
     }
