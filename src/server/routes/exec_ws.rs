@@ -108,7 +108,7 @@ async fn session(mut socket: WebSocket, state: Arc<AppState>, client: crate::ser
         _ => None,
     };
     let (mut rx, stdin_tx, kill_tx) = runner::spawn_exec_stdin(
-        &ExecRequest {
+        ExecRequest {
             program: init.program.clone(),
             args: init.args.clone(),
             timeout_secs,

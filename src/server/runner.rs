@@ -54,7 +54,7 @@ pub enum StdinMsg {
 /// 终止：输出 Receiver 全部 drop、stdin 通道关闭或向 kill 发送 true（客户端断连）→ 子进程被 kill。
 /// kill 通道独立于输出 Receiver 存在，保证"断连后仍需等待 Exit 终态写审计"的场景可用。
 pub fn spawn_exec_stdin(
-    req: &ExecRequest,
+    req: ExecRequest,
     tty_size: Option<(u16, u16)>,
 ) -> (
     mpsc::Receiver<ExecEvent>,
@@ -64,12 +64,6 @@ pub fn spawn_exec_stdin(
     let (tx, rx) = mpsc::channel::<ExecEvent>(256);
     let (stx, srx) = mpsc::channel::<StdinMsg>(32);
     let (kill_tx, kill_rx) = tokio::sync::watch::channel(false);
-    let req = ExecRequest {
-        program: req.program.clone(),
-        args: req.args.clone(),
-        timeout_secs: req.timeout_secs,
-        tty: req.tty,
-    };
     let stx_pty = stx.clone();
     tokio::spawn(async move {
         if req.tty {
@@ -809,7 +803,7 @@ mod tests {
             tty: false,
         };
 
-        let (mut rx, tx, _kill) = spawn_exec_stdin(&req, None);
+        let (mut rx, tx, _kill) = spawn_exec_stdin(req, None);
         tx.send(StdinMsg::Data(b"hello stdin\n".to_vec())).await.unwrap();
         tx.send(StdinMsg::Eof).await.unwrap();
         drop(tx);
@@ -850,7 +844,7 @@ mod tests {
             tty: true,
         };
 
-        let (mut rx, _tx, _kill) = spawn_exec_stdin(&req, None);
+        let (mut rx, _tx, _kill) = spawn_exec_stdin(req, None);
         let mut output = String::new();
         let mut exit_code = None;
         let completed = tokio::time::timeout(std::time::Duration::from_secs(10), async {

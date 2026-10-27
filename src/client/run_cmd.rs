@@ -46,21 +46,21 @@ pub async fn run(alias: &str, args: &[String]) -> Result<()> {
     // 管道 stdin → 转发原始字节，EOF 时发 stdin_close
     let stdin_task = spawn_stdin_pump(sink);
 
-    // 输出泵：Binary 按 tag 分流；Exit 取退出码
+    // 输出泵：Binary 按 tag 分流；Exit 取退出码（会话级复用句柄，避免每帧新建）
     let mut exit_code: Option<i32> = None;
+    let mut stdout = std::io::stdout();
+    let mut stderr = std::io::stderr();
     let mut stream = stream;
     while let Some(msg) = stream.next().await {
         match msg {
             Ok(frame) => match parse_frame(frame) {
                 Some(ExecFrame::Output { stream, data }) => {
                     if stream == "stderr" {
-                        let mut err = std::io::stderr();
-                        let _ = err.write_all(&data);
-                        let _ = err.flush();
+                        let _ = stderr.write_all(&data);
+                        let _ = stderr.flush();
                     } else {
-                        let mut out = std::io::stdout();
-                        let _ = out.write_all(&data);
-                        let _ = out.flush();
+                        let _ = stdout.write_all(&data);
+                        let _ = stdout.flush();
                     }
                 }
                 Some(ExecFrame::Exit { exit_code: code, timeout, .. }) => {
@@ -212,6 +212,8 @@ async fn run_pty_session(
                     Some(InputAction::Detach) => {
                         crate::dlog!("[pty-in] 客户端脱离会话（Ctrl+]）");
                         let _ = detach_tx.send(()).await;
+                        // 先发 WS Close 帧让服务端感知正常关闭（不等待回复，随后立即退出）
+                        let _ = sink.close().await;
                         break;
                     }
                 },
@@ -230,6 +232,7 @@ async fn run_pty_session(
     // 握手应答也以按键事件回流，原样转发会在查询方放弃等待后污染远端输入缓冲。
     let mut exit_code: Option<i32> = None;
     let mut detached = false;
+    let mut out = std::io::stdout();
     loop {
         tokio::select! {
             maybe = stream.next() => match maybe {
@@ -242,7 +245,6 @@ async fn run_pty_session(
                                 crate::common::escape_bytes(&data)
                             );
                         }
-                        let mut out = std::io::stdout();
                         let _ = out.write_all(&data);
                         let _ = out.flush();
                     }
@@ -468,6 +470,8 @@ fn key_to_bytes(key: crossterm::event::KeyEvent) -> Option<Vec<u8>> {
     use crossterm::event::{KeyCode, KeyModifiers};
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+    // xterm 修饰符参数：1 + Shift(1) + Alt(2) + Ctrl(4)
+    let xterm_mod = 1 + (alt as u8) * 2 + (ctrl as u8) * 4;
     match key.code {
         KeyCode::Char(c) => {
             let mut buf = [0u8; 4];
@@ -477,11 +481,15 @@ fn key_to_bytes(key: crossterm::event::KeyEvent) -> Option<Vec<u8>> {
                 out.push(0x1b);
             }
             if ctrl {
-                let b = s.as_bytes()[0];
-                if b.is_ascii_alphabetic() || (b'@'..=b'_').contains(&b) {
-                    out.push(b & 0x1f); // Ctrl+字母/@/[/\ ]/^/_ → 控制字符
+                if c == ' ' {
+                    out.push(0x00); // Ctrl+Space → NUL
                 } else {
-                    out.extend_from_slice(s.as_bytes());
+                    let b = s.as_bytes()[0];
+                    if b.is_ascii_alphabetic() || (b'@'..=b'_').contains(&b) {
+                        out.push(b & 0x1f); // Ctrl+字母/@/[/\ ]/^/_ → 控制字符
+                    } else {
+                        out.extend_from_slice(s.as_bytes());
+                    }
                 }
             } else {
                 out.extend_from_slice(s.as_bytes());
@@ -489,14 +497,14 @@ fn key_to_bytes(key: crossterm::event::KeyEvent) -> Option<Vec<u8>> {
             Some(out)
         }
         KeyCode::Enter => Some(b"\r".to_vec()),
-        KeyCode::Backspace => Some(vec![0x7f]),
+        KeyCode::Backspace => Some(if alt { b"\x1b\x7f".to_vec() } else { vec![0x7f] }),
         KeyCode::Tab => Some(b"\t".to_vec()),
         KeyCode::BackTab => Some(b"\x1b[Z".to_vec()),
         KeyCode::Esc => Some(b"\x1b".to_vec()),
-        KeyCode::Left => Some(b"\x1b[D".to_vec()),
-        KeyCode::Right => Some(b"\x1b[C".to_vec()),
-        KeyCode::Up => Some(b"\x1b[A".to_vec()),
-        KeyCode::Down => Some(b"\x1b[B".to_vec()),
+        KeyCode::Left => Some(csi_mod_seq(b"D", xterm_mod)),
+        KeyCode::Right => Some(csi_mod_seq(b"C", xterm_mod)),
+        KeyCode::Up => Some(csi_mod_seq(b"A", xterm_mod)),
+        KeyCode::Down => Some(csi_mod_seq(b"B", xterm_mod)),
         KeyCode::Home => Some(b"\x1b[H".to_vec()),
         KeyCode::End => Some(b"\x1b[F".to_vec()),
         KeyCode::PageUp => Some(b"\x1b[5~".to_vec()),
@@ -519,6 +527,19 @@ fn key_to_bytes(key: crossterm::event::KeyEvent) -> Option<Vec<u8>> {
             _ => return None,
         }),
         _ => None,
+    }
+}
+
+/// 方向键序列：无修饰为经典 `\x1b[A` 形态；带修饰附加 xterm 参数（如 Ctrl+Up → `\x1b[1;5A`、Alt+Left → `\x1b[1;3D`）
+fn csi_mod_seq(final_byte: &[u8], modifier: u8) -> Vec<u8> {
+    if modifier == 1 {
+        let mut out = vec![0x1b, b'['];
+        out.extend_from_slice(final_byte);
+        out
+    } else {
+        let mut out = format!("\x1b[1;{modifier}").into_bytes();
+        out.extend_from_slice(final_byte);
+        out
     }
 }
 
