@@ -318,14 +318,12 @@ fn oem_encoding() -> Option<&'static encoding_rs::Encoding> {
     None
 }
 
-/// 白名单匹配：程序名（取文件名部分）与白名单条目不区分大小写比较
+/// 白名单匹配：程序名与白名单条目不区分大小写**直接比较**。
+/// 不取文件名部分——否则 `D:\evil\ping.exe` / `\\host\share\ping` 等任意路径下的
+/// 同名二进制可绕过白名单；客户端应提交裸程序名。
 pub fn whitelist_matches(whitelist: &[String], program: &str) -> bool {
-    let name = std::path::Path::new(program)
-        .file_name()
-        .map(|s| s.to_string_lossy().to_string())
-        .unwrap_or_else(|| program.to_string());
-    let name = name.to_lowercase();
-    whitelist.iter().any(|entry| entry.trim().to_lowercase() == name)
+    let program = program.to_lowercase();
+    whitelist.iter().any(|entry| entry.trim().to_lowercase() == program)
 }
 
 /// 查询兜底应答：远端程序的终端查询（CPR/DA1/DA2）由服务端确定性应答。
@@ -694,6 +692,19 @@ async fn run_pty(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 白名单：程序名直接比较，任意路径下的同名二进制不得绕过
+    #[test]
+    fn whitelist_rejects_path_prefixed_program() {
+        let wl = ["ping".to_string(), "git".to_string()];
+        assert!(whitelist_matches(&wl, "ping"));
+        assert!(whitelist_matches(&wl, "GIT"));
+        // 含路径分隔符的同名程序：即使文件名在白名单内也必须拒绝
+        assert!(!whitelist_matches(&wl, "D:\\evil\\ping.exe"));
+        assert!(!whitelist_matches(&wl, "\\\\host\\share\\ping"));
+        assert!(!whitelist_matches(&wl, "/tmp/git"));
+        assert!(!whitelist_matches(&wl, ""));
+    }
 
     /// CPR/DA1/DA2/DECRQM 查询识别
     #[test]
