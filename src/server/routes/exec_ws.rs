@@ -108,7 +108,7 @@ async fn session(mut socket: WebSocket, state: Arc<AppState>, client: crate::ser
         (Some(c), Some(r)) if c > 0 && r > 0 && c <= 1024 && r <= 1024 => Some((c, r)),
         _ => None,
     };
-    let (mut rx, stdin_tx) = runner::spawn_exec_stdin(
+    let (mut rx, stdin_tx, kill_tx) = runner::spawn_exec_stdin(
         &ExecRequest {
             program: init.program.clone(),
             args: init.args.clone(),
@@ -122,7 +122,8 @@ async fn session(mut socket: WebSocket, state: Arc<AppState>, client: crate::ser
         return; // rx 随函数返回被 drop → 子进程被 kill
     }
 
-    // 下行泵：exec 事件 → WS 帧；Exit 后关闭连接
+    // 下行泵：exec 事件 → WS 帧。Exit 终态先写审计/历史再尝试发送——
+    // 客户端断连时发送必然失败，但审计闭环不能因此丢失（原先 abort 下行任务导致断连会话缺 exec.finish）。
     let client_id = client.id.clone();
     let program = init.program.clone();
     let program_dl = program.clone();
@@ -132,18 +133,21 @@ async fn session(mut socket: WebSocket, state: Arc<AppState>, client: crate::ser
     let downlink = tokio::spawn(async move {
         let program = program_dl;
         while let Some(ev) = rx.recv().await {
-            let is_exit = matches!(ev, ExecEvent::Exit { .. });
-            let msg = event_message(&ev);
-            if sink.send(msg).await.is_err() {
-                break;
-            }
-            if is_exit {
-                if let ExecEvent::Exit { exit_code, timeout, duration_ms, truncated } = ev {
+            match ev {
+                ExecEvent::Exit { exit_code, timeout, duration_ms, truncated } => {
                     write_history(&audit, &client_id, &hostname, &program, &args, exit_code, timeout, duration_ms, truncated);
                     audit.log("exec.finish", &hostname, Some(serde_json::json!({ "program": program })));
+                    let msg = event_message(&ExecEvent::Exit { exit_code, timeout, duration_ms, truncated });
+                    let _ = sink.send(msg).await;
+                    let _ = sink.close().await;
+                    break;
                 }
-                let _ = sink.close().await;
-                break;
+                other => {
+                    // 客户端断连后发送失败：继续排空直至 Exit 终态，保证审计闭环
+                    if sink.send(event_message(&other)).await.is_err() {
+                        continue;
+                    }
+                }
             }
         }
     });
@@ -196,9 +200,12 @@ async fn session(mut socket: WebSocket, state: Arc<AppState>, client: crate::ser
         }
     }
 
-    // 上行结束（客户端断连）：释放 rx → tx.closed() 触发子进程终止
-    downlink.abort();
+    // 上行结束（客户端断连）：关闭 stdin 通道并触发 kill → 执行器终止子进程后发送 Exit 终态，
+    // downlink 完成审计/历史写入后自然退出（原先直接 abort 下行会丢断连会话的 exec.finish）。
     drop(stdin_tx);
+    let _ = kill_tx.send(true);
+    // 兜底：执行器各退出路径均会发送 Exit；限时等待防止许可被意外长期占用
+    let _ = tokio::time::timeout(Duration::from_secs(15), downlink).await;
 }
 
 async fn read_init(socket: &mut WebSocket) -> Result<WsInit, String> {

@@ -50,15 +50,21 @@ pub enum StdinMsg {
     Resize { cols: u16, rows: u16 },
 }
 
-/// 启动子进程（stdin 已接管）：返回 (输出事件流, stdin 发送端)。
+/// 启动子进程（stdin 已接管）：返回 (输出事件流, stdin 发送端, 终止信号)。
 /// tty_size 为 PTY 初始尺寸（PTY 会话由客户端随 init 帧上报本地终端尺寸，避免 80x24 初始竞态）。
-/// Sender drop 与发送 Eof 等价（关闭子进程 stdin）；输出 Receiver 被 drop（客户端断连）时子进程被 kill。
+/// 终止：输出 Receiver 全部 drop、stdin 通道关闭或向 kill 发送 true（客户端断连）→ 子进程被 kill。
+/// kill 通道独立于输出 Receiver 存在，保证"断连后仍需等待 Exit 终态写审计"的场景可用。
 pub fn spawn_exec_stdin(
     req: &ExecRequest,
     tty_size: Option<(u16, u16)>,
-) -> (mpsc::Receiver<ExecEvent>, mpsc::Sender<StdinMsg>) {
+) -> (
+    mpsc::Receiver<ExecEvent>,
+    mpsc::Sender<StdinMsg>,
+    tokio::sync::watch::Sender<bool>,
+) {
     let (tx, rx) = mpsc::channel::<ExecEvent>(256);
     let (stx, srx) = mpsc::channel::<StdinMsg>(32);
+    let (kill_tx, kill_rx) = tokio::sync::watch::channel(false);
     let req = ExecRequest {
         program: req.program.clone(),
         args: req.args.clone(),
@@ -68,15 +74,20 @@ pub fn spawn_exec_stdin(
     let stx_pty = stx.clone();
     tokio::spawn(async move {
         if req.tty {
-            run_pty(req, tx, stx_pty, srx, tty_size).await;
+            run_pty(req, tx, stx_pty, srx, tty_size, kill_rx).await;
         } else {
-            run(req, tx, srx).await;
+            run(req, tx, srx, kill_rx).await;
         }
     });
-    (rx, stx)
+    (rx, stx, kill_tx)
 }
 
-async fn run(req: ExecRequest, tx: mpsc::Sender<ExecEvent>, mut stdin_rx: mpsc::Receiver<StdinMsg>) {
+async fn run(
+    req: ExecRequest,
+    tx: mpsc::Sender<ExecEvent>,
+    mut stdin_rx: mpsc::Receiver<StdinMsg>,
+    mut kill_rx: tokio::sync::watch::Receiver<bool>,
+) {
     let started = Instant::now();
     let truncated = Arc::new(AtomicBool::new(false));
 
@@ -156,6 +167,7 @@ async fn run(req: ExecRequest, tx: mpsc::Sender<ExecEvent>, mut stdin_rx: mpsc::
     enum WaitOut {
         Code(Option<i32>),
         Disconnected,
+        Killed,
     }
     let outcome = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
         loop {
@@ -163,6 +175,8 @@ async fn run(req: ExecRequest, tx: mpsc::Sender<ExecEvent>, mut stdin_rx: mpsc::
                 r = child.wait() => break WaitOut::Code(r.ok().and_then(|s| s.code())),
                 // 所有事件接收端已断开（客户端断连）→ 终止子进程
                 _ = tx.closed() => break WaitOut::Disconnected,
+                // 会话层显式终止（断连后仍需发 Exit 终态供下行写审计）
+                _ = kill_rx.changed() => break WaitOut::Killed,
             }
         }
     })
@@ -170,7 +184,7 @@ async fn run(req: ExecRequest, tx: mpsc::Sender<ExecEvent>, mut stdin_rx: mpsc::
 
     let (exit_code, timed_out) = match outcome {
         Ok(WaitOut::Code(code)) => (code, false),
-        Ok(WaitOut::Disconnected) => {
+        Ok(WaitOut::Disconnected) | Ok(WaitOut::Killed) => {
             let _ = child.kill().await;
             let _ = child.wait().await;
             (None, false)
@@ -425,6 +439,7 @@ async fn run_pty(
     stdin_tx: mpsc::Sender<StdinMsg>,
     mut stdin_rx: mpsc::Receiver<StdinMsg>,
     tty_size: Option<(u16, u16)>,
+    mut kill_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     use portable_pty::{CommandBuilder, PtySize};
 
@@ -662,7 +677,7 @@ async fn run_pty(
         }
     });
 
-    // 等待退出；客户端断连（tx.closed）→ kill。PTY 会话无超时。
+    // 等待退出；客户端断连（tx.closed 或会话层 kill 信号）→ kill。PTY 会话无超时。
     let mut killer = child.clone_killer();
     let mut wait_task = tokio::task::spawn_blocking(move || child.wait());
     let mut exit_code: Option<i32> = None;
@@ -671,6 +686,11 @@ async fn run_pty(
             exit_code = st.ok().and_then(|r| r.ok()).map(|s| s.exit_code() as i32);
         }
         _ = tx.closed() => {
+            let _ = killer.kill();
+            let _ = tokio::time::timeout(Duration::from_secs(5), &mut wait_task).await;
+        }
+        _ = kill_rx.changed() => {
+            // 会话层显式终止（断连后仍需发 Exit 终态供下行写审计）
             let _ = killer.kill();
             let _ = tokio::time::timeout(Duration::from_secs(5), &mut wait_task).await;
         }
@@ -780,7 +800,7 @@ mod tests {
             tty: false,
         };
 
-        let (mut rx, tx) = spawn_exec_stdin(&req, None);
+        let (mut rx, tx, _kill) = spawn_exec_stdin(&req, None);
         tx.send(StdinMsg::Data(b"hello stdin\n".to_vec())).await.unwrap();
         tx.send(StdinMsg::Eof).await.unwrap();
         drop(tx);
@@ -823,7 +843,7 @@ mod tests {
             tty: true,
         };
 
-        let (mut rx, _tx) = spawn_exec_stdin(&req, None);
+        let (mut rx, _tx, _kill) = spawn_exec_stdin(&req, None);
         let mut output = String::new();
         let mut exit_code = None;
         let completed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
