@@ -15,6 +15,7 @@ import { nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import { ToolPanel } from '@develon/webui-panel'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
+import { deep as xtermTheme } from 'xterm-theme'
 import '@xterm/xterm/css/xterm.css'
 import { formatDuration } from '../../shared/utils'
 
@@ -205,9 +206,9 @@ onMounted(() => {
   if (props.mode !== 'terminal' || !termHost.value) return
   term = new Terminal({
     fontFamily: "Consolas, 'JetBrains Mono', monospace",
-    fontSize: 13,
+    fontSize: 14,
     cursorBlink: true,
-    theme: { background: '#1f232b', foreground: '#e3e7ef', cursor: '#27c2dc' },
+    theme: xtermTheme, // xterm-theme 的 Deep 主题（纯黑底高对比）
   })
   fit = new FitAddon()
   term.loadAddon(fit)
