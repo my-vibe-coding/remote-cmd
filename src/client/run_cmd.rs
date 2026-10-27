@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use super::config::{load_aliases, render_template, ClientConfig, ServerReg};
-use super::remote::{parse_frame, resize_msg, ws_exec, ExecFrame, ExecWs, STDIN_CLOSE};
+use super::remote::{parse_frame, resize_msg, trace_frame, ws_exec, ExecFrame, ExecWs, STDIN_CLOSE};
 
 /// WS 心跳间隔：空闲会话周期发 Ping，防 NAT/代理静默掐断长连接
 const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -53,38 +53,54 @@ pub async fn run(alias: &str, args: &[String]) -> Result<()> {
     let mut stream = stream;
     while let Some(msg) = stream.next().await {
         match msg {
-            Ok(frame) => match parse_frame(frame) {
-                Some(ExecFrame::Output { stream, data }) => {
-                    if stream == "stderr" {
-                        let _ = stderr.write_all(&data);
-                        let _ = stderr.flush();
-                    } else {
-                        let _ = stdout.write_all(&data);
-                        let _ = stdout.flush();
+            Ok(frame) => {
+                let control = trace_frame(&frame);
+                match parse_frame(frame) {
+                    Some(ExecFrame::Output { stream, data }) => {
+                        if stream == "stderr" {
+                            let _ = stderr.write_all(&data);
+                            let _ = stderr.flush();
+                        } else {
+                            let _ = stdout.write_all(&data);
+                            let _ = stdout.flush();
+                        }
+                    }
+                    Some(ExecFrame::Exit { exit_code: code, timeout, .. }) => {
+                        crate::dlog!("[run] 收到 Exit 终态 exit_code={code:?} timeout={timeout}");
+                        if timeout {
+                            eprintln!("[remote-cmd] 远程命令执行超时");
+                        }
+                        exit_code = code;
+                        break;
+                    }
+                    None => {
+                        if !control {
+                            crate::dlog!("[run] 收到无法解析的 WS 帧（未知 Binary 标签或非 exit JSON）");
+                        }
                     }
                 }
-                Some(ExecFrame::Exit { exit_code: code, timeout, .. }) => {
-                    if timeout {
-                        eprintln!("[remote-cmd] 远程命令执行超时");
-                    }
-                    exit_code = code;
-                    break;
-                }
-                None => {}
-            },
+            }
             Err(e) => {
+                crate::dlog!("[run] WS 连接错误: {e}");
                 eprintln!("[remote-cmd] 连接中断: {e}");
                 break;
             }
         }
     }
+    if exit_code.is_none() {
+        crate::dlog!("[run] 输出流结束且未见 Exit 终态（连接被服务端关闭）");
+    }
 
     stdin_task.abort();
 
     match exit_code {
-        Some(code) => std::process::exit(code),
+        Some(code) => {
+            crate::dlog!("[run] 进程退出 exit_code={code}");
+            std::process::exit(code)
+        }
         None => {
             // 进程被 kill / 启动失败 / 连接中断
+            crate::dlog!("[run] 进程异常退出（无 Exit 终态），exit 1");
             eprintln!("[remote-cmd] 远程命令异常退出");
             std::process::exit(1);
         }
@@ -117,15 +133,21 @@ fn spawn_stdin_pump(
                 data = rx.recv() => match data {
                     Some(data) => WsMessage::Binary(data.into()),
                     None => {
+                        crate::dlog!("[stdin] 本地 stdin EOF，发送 stdin_close");
                         // 本地 EOF → 通知服务端关闭子进程 stdin
                         let _ = sink.send(WsMessage::Text(STDIN_CLOSE.into())).await;
                         let _ = reader.await;
+                        crate::dlog!("[stdin] stdin 泵结束");
                         return;
                     }
                 },
-                _ = ping.tick() => WsMessage::Ping(vec![].into()),
+                _ = ping.tick() => {
+                    crate::dlog!("[ws] 空闲心跳：发送 Ping");
+                    WsMessage::Ping(vec![].into())
+                }
             };
             if sink.send(msg).await.is_err() {
+                crate::dlog!("[stdin] WS 发送失败，stdin 泵终止");
                 return;
             }
         }
@@ -217,9 +239,13 @@ async fn run_pty_session(
                         break;
                     }
                 },
-                _ = ping.tick() => WsMessage::Ping(vec![].into()),
+                _ = ping.tick() => {
+                    crate::dlog!("[ws] 空闲心跳：发送 Ping");
+                    WsMessage::Ping(vec![].into())
+                }
             };
             if sink.send(msg).await.is_err() {
+                crate::dlog!("[ws] 输入帧发送失败，输入转发终止（连接可能已断开）");
                 break;
             }
         }
@@ -233,32 +259,47 @@ async fn run_pty_session(
     let mut exit_code: Option<i32> = None;
     let mut detached = false;
     let mut out = std::io::stdout();
+    crate::dlog!("[pty] 进入交互会话循环");
     loop {
         tokio::select! {
             maybe = stream.next() => match maybe {
-                Some(Ok(frame)) => match parse_frame(frame) {
-                    Some(ExecFrame::Output { data, .. }) => {
-                        if crate::common::looks_like_query(&data) {
-                            crate::dlog!(
-                                "[pty-out] 客户端收到远端查询 {} 字节: {}",
-                                data.len(),
-                                crate::common::escape_bytes(&data)
-                            );
+                Some(Ok(frame)) => {
+                    let control = trace_frame(&frame);
+                    match parse_frame(frame) {
+                        Some(ExecFrame::Output { data, .. }) => {
+                            if crate::common::looks_like_query(&data) {
+                                crate::dlog!(
+                                    "[pty-out] 客户端收到远端查询 {} 字节: {}",
+                                    data.len(),
+                                    crate::common::escape_bytes(&data)
+                                );
+                            }
+                            let _ = out.write_all(&data);
+                            let _ = out.flush();
                         }
-                        let _ = out.write_all(&data);
-                        let _ = out.flush();
+                        Some(ExecFrame::Exit { exit_code: code, timeout, duration_ms, truncated }) => {
+                            crate::dlog!(
+                                "[pty] 收到 Exit 终态 exit_code={code:?} timeout={timeout} duration_ms={duration_ms} truncated={truncated}"
+                            );
+                            exit_code = code;
+                            break;
+                        }
+                        None => {
+                            if !control {
+                                crate::dlog!("[pty-out] 收到无法解析的 WS 帧（未知 Binary 标签或非 exit JSON）");
+                            }
+                        }
                     }
-                    Some(ExecFrame::Exit { exit_code: code, .. }) => {
-                        exit_code = code;
-                        break;
-                    }
-                    None => {}
-                },
+                }
                 Some(Err(e)) => {
+                    crate::dlog!("[pty] WS 连接错误: {e}");
                     eprintln!("[remote-cmd] 连接中断: {e}");
                     break;
                 }
-                None => break,
+                None => {
+                    crate::dlog!("[pty] 输出流结束且未见 Exit/Close（连接被服务端静默关闭）");
+                    break;
+                }
             },
             _ = detach_rx.recv() => {
                 detached = true;
@@ -266,6 +307,7 @@ async fn run_pty_session(
             }
         }
     }
+    crate::dlog!("[pty] 会话循环结束 detached={detached} exit_code={exit_code:?}");
 
     forward.abort();
     let _ = crossterm::terminal::disable_raw_mode();
@@ -277,8 +319,15 @@ async fn run_pty_session(
     }
 
     match exit_code {
-        Some(code) => std::process::exit(code),
+        Some(code) => {
+            crate::dlog!("[pty] 进程退出 exit_code={code}");
+            // 交互会话：远端退出（含容器重启杀 exec 等场景）必须给出可见提示，
+            // 否则表现为"无任何提示的自动退出"（退出码本身仍透传）
+            eprintln!("[remote-cmd] 远程会话已结束，退出码 {code}");
+            std::process::exit(code)
+        }
         None => {
+            crate::dlog!("[pty] 进程异常退出（无 Exit 终态），exit 1");
             eprintln!("[remote-cmd] 远程命令异常退出");
             std::process::exit(1);
         }

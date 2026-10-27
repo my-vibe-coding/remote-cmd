@@ -54,6 +54,7 @@ pub fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> AppResult<()> {
 }
 
 /// 读取 jsonl 文件全部行；不存在返回空
+#[allow(unused)]
 pub fn load_jsonl<T: DeserializeOwned>(path: &Path) -> AppResult<Vec<T>> {
     let mut out = vec![];
     let Ok(content) = std::fs::read_to_string(path) else {

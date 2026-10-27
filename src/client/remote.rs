@@ -181,13 +181,20 @@ pub async fn ws_exec(
         .headers_mut()
         .insert("X-Client-Token", token.parse().map_err(|_| anyhow::anyhow!("token 含非法字符"))?);
 
-    let (ws, _) = connect_async_tls_with_config(
+    let (ws, _) = match connect_async_tls_with_config(
         request,
         None,
         false,
         Some(tls_connector(cert_sha256.and_then(parse_pin), None)),
     )
-    .await?;
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            crate::dlog!("[ws] TLS/WS 连接失败: {e}");
+            anyhow::bail!("{e}");
+        }
+    };
     let (mut sink, mut stream) = ws.split();
 
     let (cols, rows) = tty_size.unwrap_or((0, 0));
@@ -224,13 +231,44 @@ pub async fn ws_exec(
                         crate::dlog!("[ws] 服务端拒绝会话: {}", v["reason"].as_str().unwrap_or(""));
                         anyhow::bail!("{}", v["reason"].as_str().unwrap_or("执行被拒绝"));
                     }
-                    _ => {}
+                    other => {
+                        crate::dlog!("[ws] 握手期间收到未预期的文本帧: {other:?}");
+                    }
                 }
             }
-            Some(Ok(_)) => {}
-            Some(Err(e)) => anyhow::bail!("WebSocket 错误: {e}"),
-            None => anyhow::bail!("连接已关闭"),
+            Some(Ok(frame)) => {
+                crate::dlog!("[ws] 握手期间收到非文本帧（已忽略）");
+                let _ = frame;
+            }
+            Some(Err(e)) => {
+                crate::dlog!("[ws] 握手期间 WebSocket 错误: {e}");
+                anyhow::bail!("WebSocket 错误: {e}");
+            }
+            None => {
+                crate::dlog!("[ws] 握手期间连接被关闭");
+                anyhow::bail!("连接已关闭");
+            }
         }
+    }
+}
+
+/// WS 帧类型 trace 日志（联调用）：控制帧（Ping/Pong/Close）逐帧记录，用于定位心跳与断连问题。
+/// 返回是否为控制帧（控制帧不进入 parse_frame 的应用层解析，调用方据此区分"无法解析"）。
+pub fn trace_frame(frame: &WsMessage) -> bool {
+    match frame {
+        WsMessage::Ping(_) => {
+            crate::dlog!("[ws] 收到服务端 Ping 帧");
+            true
+        }
+        WsMessage::Pong(_) => {
+            crate::dlog!("[ws] 收到服务端 Pong 帧");
+            true
+        }
+        WsMessage::Close(_) => {
+            crate::dlog!("[ws] 收到服务端 Close 帧");
+            true
+        }
+        _ => false,
     }
 }
 

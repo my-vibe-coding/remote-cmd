@@ -178,12 +178,14 @@ async fn run(
     let (exit_code, timed_out) = match outcome {
         Ok(WaitOut::Code(code)) => (code, false),
         Ok(WaitOut::Disconnected) | Ok(WaitOut::Killed) => {
+            macro_log::w!("[run] 客户端断连/会话终止信号，终止子进程 program={}", req.program);
             let _ = child.kill().await;
             let _ = child.wait().await;
             (None, false)
         }
         Err(_) => {
             // 超时：kill 后等待读取任务收尾
+            macro_log::w!("[run] 命令执行超时，终止子进程 program={}", req.program);
             let _ = child.kill().await;
             let _ = child.wait().await;
             (None, true)
@@ -510,12 +512,17 @@ async fn run_pty(
             .take_writer()
             .ok();
         let write_thread = std::thread::spawn(move || {
-            let Some(mut w) = taken else { return; };
+            let Some(mut w) = taken else {
+                macro_log::w!("[pty-stdin] PTY 写端获取失败，stdin 写线程退出");
+                return;
+            };
             while let Ok(data) = wrx.recv() {
                 if w.write_all(&data).and_then(|_| w.flush()).is_err() {
+                    macro_log::w!("[pty-stdin] PTY 写入失败，stdin 写线程退出");
                     break;
                 }
             }
+            macro_log::d!("[pty-stdin] stdin 写线程结束");
         });
         let mut closed = std::pin::pin!(tx_writer.closed());
         loop {
@@ -687,13 +694,16 @@ async fn run_pty(
     tokio::select! {
         st = &mut wait_task => {
             exit_code = st.ok().and_then(|r| r.ok()).map(|s| s.exit_code() as i32);
+            macro_log::d!("[pty] 子进程自行退出 code={exit_code:?}");
         }
         _ = tx.closed() => {
+            macro_log::w!("[pty] 输出事件接收端全部关闭（客户端断连），终止子进程");
             let _ = killer.kill();
             let _ = tokio::time::timeout(Duration::from_secs(5), &mut wait_task).await;
         }
         _ = kill_rx.changed() => {
             // 会话层显式终止（断连后仍需发 Exit 终态供下行写审计）
+            macro_log::w!("[pty] 收到会话层终止信号，终止子进程");
             let _ = killer.kill();
             let _ = tokio::time::timeout(Duration::from_secs(5), &mut wait_task).await;
         }
