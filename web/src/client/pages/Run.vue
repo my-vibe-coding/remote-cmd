@@ -1,39 +1,23 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
-import { ToolPanel, ToolPanelManager } from '@develon/webui-panel'
-import { Terminal } from '@xterm/xterm'
-import { FitAddon } from '@xterm/addon-fit'
-import '@xterm/xterm/css/xterm.css'
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
+import { ToolPanelManager } from '@develon/webui-panel'
+import ExecPanel from '../components/ExecPanel.vue'
 import { ApiError, localApi, type AliasDefInfo, type ServerRegInfo } from '../../shared/api'
-import {
-  consumeSse,
-  decodeBase64Utf8,
-  type ExecExitPayload,
-  type ExecOutputPayload,
-} from '../../shared/sse'
-import { formatDuration, nowShort } from '../../shared/utils'
+import { consumeSse, decodeBase64Utf8, type ExecOutputPayload } from '../../shared/sse'
+import { nowShort } from '../../shared/utils'
 
-// ---------- 输出面板数据模型 ----------
-type LineKind = 'stdout' | 'stderr' | 'sys'
-
-interface OutLine {
-  kind: LineKind
-  text: string
-}
-
-interface RunItem {
+// ---------- 会话数据模型 ----------
+// 展示状态（输出行缓冲、终端实例、终态徽标）全部内聚在 ExecPanel 组件内，
+// 页面只持有会话元信息与连接句柄（SSE AbortController / PTY WebSocket）。
+interface RunSession {
   id: number
   title: string
   alias: string
-  lines: OutLine[]
-  running: boolean
-  finished: boolean
-  exitCode: number | null
-  timeout: boolean
-  truncated: boolean
-  durationMs: number | null
-  /** 交互模式：xterm 渲染 + WS PTY 桥；否则为 SSE 只读流 */
+  args: string[]
+  /** 交互终端模式（PTY WS 桥）；否则为 SSE 只读流 */
   pty: boolean
+  /** 首行系统提示（▶ 命令回显，仅只读模式显示） */
+  sysLine: string
 }
 
 const aliases = ref<Record<string, AliasDefInfo>>({})
@@ -43,85 +27,8 @@ const argsText = ref('')
 const formError = ref('')
 /** 交互模式开关（PTY 终端）；关闭则走 SSE 只读流 */
 const ptyMode = ref(true)
-const runs = reactive<RunItem[]>([])
+const runs = reactive<RunSession[]>([])
 let nextId = 1
-
-// ---------- 输出行缓冲 ----------
-// SSE 的 Output 事件是管道任意分片（不保证按行分割），需按 \n 缓冲成完整行；
-// \r 按终端覆盖语义处理（进度条回写）：\r 后的内容从行首覆盖，最终行 = overlay(基准, 新内容)；
-// stdout/stderr 各自独立缓冲。
-interface StreamBufState {
-  acc: string // 当前未落行的新写入内容（\r 后的光标区）
-  crBase: string | null // 最近一次 \r 时的行内容基准；null = 无待处理 \r
-  openIdx: number | null // 正在构建的行在 lines 中的下标
-}
-const streamBufs = new Map<number, Map<string, StreamBufState>>()
-
-/** 终端覆盖语义：over 从行首覆盖 base，超出部分保留 base 尾部 */
-function overlay(base: string, over: string): string {
-  return over.length >= base.length ? over : over + base.slice(over.length)
-}
-
-function displayOf(st: StreamBufState): string {
-  return st.crBase != null ? overlay(st.crBase, st.acc) : st.acc
-}
-
-function bufStateFor(runId: number, stream: string): StreamBufState {
-  let m = streamBufs.get(runId)
-  if (!m) {
-    m = new Map()
-    streamBufs.set(runId, m)
-  }
-  let st = m.get(stream)
-  if (!st) {
-    st = { acc: '', crBase: null, openIdx: null }
-    m.set(stream, st)
-  }
-  return st
-}
-
-function dropRunBuffers(runId: number) {
-  streamBufs.delete(runId)
-}
-
-/** 将一块输出文本按行并入面板（跨块续行 + \r 覆盖语义） */
-function feedOutput(item: RunItem, stream: 'stdout' | 'stderr', text: string) {
-  const st = bufStateFor(item.id, stream)
-  const flush = () => {
-    const line = displayOf(st)
-    if (st.openIdx != null && item.lines[st.openIdx]) item.lines[st.openIdx].text = line
-    else item.lines.push({ kind: stream, text: line })
-    st.acc = ''
-    st.crBase = null
-    st.openIdx = null
-  }
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i]
-    if (ch === '\r') {
-      if (text[i + 1] === '\n') {
-        // CRLF：正常换行，内容保持不变
-        i++
-        flush()
-      } else {
-        // 单独 \r：光标回到行首，后续内容从行首覆盖
-        st.crBase = st.crBase != null ? overlay(st.crBase, st.acc) : st.acc
-        st.acc = ''
-      }
-    } else if (ch === '\n') {
-      flush()
-    } else {
-      st.acc += ch
-    }
-  }
-  // 行尾缓冲落到正在构建的行（无则新建；空内容不占行）
-  const disp = displayOf(st)
-  if (st.openIdx != null && item.lines[st.openIdx]) {
-    item.lines[st.openIdx].text = disp
-  } else if (disp !== '') {
-    item.lines.push({ kind: stream, text: disp })
-    st.openIdx = item.lines.length - 1
-  }
-}
 
 const aliasNames = computed(() => Object.keys(aliases.value))
 
@@ -153,22 +60,22 @@ async function load() {
   }
 }
 
-// ---------- 执行（POST SSE） ----------
+// ---------- 面板句柄与连接句柄 ----------
+type PanelApi = InstanceType<typeof ExecPanel>
+
+const panels = new Map<number, PanelApi>()
 const controllers = new Map<number, AbortController>()
-const bodyEls = new Map<number, HTMLElement>()
+const ptySockets = new Map<number, WebSocket>()
 
-function registerBody(id: number, el: unknown) {
-  if (el instanceof HTMLElement) bodyEls.set(id, el)
-  else bodyEls.delete(id)
+/** v-for 动态 ref：面板卸载时自动清理 */
+function registerPanel(id: number, el: unknown) {
+  if (el) panels.set(id, el as PanelApi)
+  else panels.delete(id)
 }
 
-function scrollToBottom(id: number) {
-  void nextTick(() => {
-    const el = bodyEls.get(id)
-    if (el) el.scrollTop = el.scrollHeight
-  })
-}
+const enc = new TextEncoder()
 
+// ---------- 执行入口 ----------
 async function run() {
   if (!alias.value) {
     formError.value = '请先选择要执行的命令别名'
@@ -178,203 +85,122 @@ async function run() {
   const args = argsText.value.trim() ? argsText.value.trim().split(/\s+/) : []
 
   const serverLabel = boundServerLabel(alias.value)
-  const item = reactive<RunItem>({
+  const item: RunSession = {
     id: nextId++,
     title: `${alias.value} · ${nowShort()}`,
     alias: alias.value,
-    lines: [],
-    running: true,
-    finished: false,
-    exitCode: null,
-    timeout: false,
-    truncated: false,
-    durationMs: null,
+    args,
     pty: ptyMode.value,
-  })
-  if (!item.pty) {
-    item.lines.push({
-      kind: 'sys',
-      text: `▶ ${serverLabel ? `[${serverLabel}] ` : ''}${alias.value}${args.length ? ' ' + args.join(' ') : ''}`,
-    })
+    sysLine: `▶ ${serverLabel ? `[${serverLabel}] ` : ''}${alias.value}${args.length ? ' ' + args.join(' ') : ''}`,
   }
   runs.push(item)
   argsText.value = ''
-
-  if (item.pty) startPty(item, args)
-  else startSse(item, args)
+  // PTY 模式的 WS 连接在面板 ready 事件后建立（需要终端自适应出的列行数）
+  if (!item.pty) startSse(item)
 }
 
-/** SSE 只读流（管道模式，无 stdin 交互） */
-async function startSse(item: RunItem, args: string[]) {
+// ---------- SSE 只读会话（管道模式，无 stdin 交互） ----------
+async function startSse(item: RunSession) {
+  const panel = () => panels.get(item.id)
   const controller = new AbortController()
   controllers.set(item.id, controller)
 
   try {
-    const res = await localApi.exec(item.alias, args, controller.signal)
+    const res = await localApi.exec(item.alias, item.args, controller.signal)
     await consumeSse(res, (ev) => {
       if (ev.event === 'output') {
         const payload = JSON.parse(ev.data) as ExecOutputPayload
         if (payload.type !== 'output') return
         if (payload.stream === '__truncated__') {
-          item.truncated = true
-          item.lines.push({ kind: 'sys', text: '⚠ 输出超过 1MB，已被截断' })
+          panel()?.markTruncated()
         } else {
-          feedOutput(item, payload.stream, decodeBase64Utf8(payload.data_b64))
+          panel()?.feed(payload.stream, decodeBase64Utf8(payload.data_b64))
         }
       } else if (ev.event === 'exit') {
-        const payload = JSON.parse(ev.data) as ExecExitPayload
-        item.exitCode = payload.exit_code
-        item.timeout = payload.timeout
-        item.durationMs = payload.duration_ms
-        item.truncated = item.truncated || payload.truncated
-        item.lines.push({
-          kind: 'sys',
-          text: `■ 进程退出，耗时 ${formatDuration(payload.duration_ms)}${payload.timeout ? '（超时终止）' : ''}`,
-        })
-        item.running = false
-        item.finished = true
+        panel()?.finish(JSON.parse(ev.data))
       }
-      scrollToBottom(item.id)
     })
     // 流提前结束但没收到 exit 事件
-    if (item.running) {
-      item.running = false
-      item.finished = true
-    }
-    dropRunBuffers(item.id)
+    panel()?.finish(null)
   } catch (e) {
-    item.running = false
-    item.finished = true
-    dropRunBuffers(item.id)
     const msg = e instanceof ApiError ? `请求失败 (HTTP ${e.status})：${e.message}` : String(e)
-    item.lines.push({ kind: 'stderr', text: msg })
-    scrollToBottom(item.id)
+    panel()?.feed('stderr', msg)
+    panel()?.finish(null)
   } finally {
     controllers.delete(item.id)
   }
 }
 
-// ---------- 交互终端（xterm + WS PTY 桥） ----------
+// ---------- PTY 交互会话（WS 桥，协议见 routes.rs exec_pty） ----------
 
-interface TermSession {
-  term: Terminal
-  fit: FitAddon
-  ws: WebSocket
-  ro: ResizeObserver
-}
-const terms = new Map<number, TermSession>()
-const termHosts = new Map<number, HTMLElement>()
+/** terminal 就绪：按自适应出的列行数建立 WS 连接 */
+function openPtySession(item: RunSession, size: { cols: number; rows: number }) {
+  const panel = panels.get(item.id)
+  if (!panel) return
 
-function registerTermHost(id: number, el: unknown) {
-  if (el instanceof HTMLElement) termHosts.set(id, el)
-  else termHosts.delete(id)
-}
+  const qs = new URLSearchParams()
+  qs.set('alias', item.alias)
+  for (const a of item.args) qs.append('args', a)
+  qs.set('cols', String(size.cols))
+  qs.set('rows', String(size.rows))
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+  const ws = new WebSocket(`${proto}://${location.host}/api/local/exec-pty?${qs}`)
+  ws.binaryType = 'arraybuffer'
+  ptySockets.set(item.id, ws)
 
-/** PTY 交互模式：xterm 渲染远端输出，键入/resize 经 WS 桥转发（协议见 routes.rs exec_pty） */
-function startPty(item: RunItem, args: string[]) {
-  void nextTick(() => {
-    const host = termHosts.get(item.id)
-    if (!host) {
-      item.running = false
-      item.finished = true
-      item.lines.push({ kind: 'stderr', text: '终端容器未就绪' })
-      return
-    }
-    const term = new Terminal({
-      fontFamily: "Consolas, 'JetBrains Mono', monospace",
-      fontSize: 13,
-      cursorBlink: true,
-      theme: { background: '#1f232b', foreground: '#e3e7ef', cursor: '#27c2dc' },
-    })
-    const fit = new FitAddon()
-    term.loadAddon(fit)
-    term.open(host)
-    if (host.clientWidth > 0) fit.fit()
-
-    const qs = new URLSearchParams()
-    qs.set('alias', item.alias)
-    for (const a of args) qs.append('args', a)
-    qs.set('cols', String(term.cols))
-    qs.set('rows', String(term.rows))
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws'
-    const ws = new WebSocket(`${proto}://${location.host}/api/local/exec-pty?${qs}`)
-    ws.binaryType = 'arraybuffer'
-
-    const enc = new TextEncoder()
-    term.onData((d) => {
-      if (ws.readyState === WebSocket.OPEN) ws.send(enc.encode(d))
-    })
-    term.onResize(({ cols, rows }) => {
-      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'resize', cols, rows }))
-    })
-
-    const finish = (payload: ExecExitPayload | null) => {
-      item.running = false
-      item.finished = true
-      if (payload) {
-        item.exitCode = payload.exit_code
-        item.timeout = payload.timeout
-        item.durationMs = payload.duration_ms
-        item.truncated = item.truncated || payload.truncated
-      }
-    }
-
-    ws.onmessage = (e) => {
-      if (typeof e.data === 'string') {
-        try {
-          const v = JSON.parse(e.data)
-          if (v.type === 'exit') finish(v as ExecExitPayload)
-          else if (v.type === 'error') {
-            term.write(`\r\n\x1b[31m${v.message ?? '连接失败'}\x1b[0m\r\n`)
-            finish(null)
-          }
-        } catch {
-          /* 忽略非 JSON 文本帧 */
+  ws.onmessage = (e) => {
+    if (typeof e.data === 'string') {
+      try {
+        const v = JSON.parse(e.data)
+        if (v.type === 'exit') panel.finish(v)
+        else if (v.type === 'error') {
+          panel.termWrite(`\r\n\x1b[31m${v.message ?? '连接失败'}\x1b[0m\r\n`)
+          panel.finish(null)
         }
-      } else {
-        term.write(new Uint8Array(e.data as ArrayBuffer))
+      } catch {
+        /* 忽略非 JSON 文本帧 */
       }
+    } else {
+      panel.termWrite(new Uint8Array(e.data as ArrayBuffer))
     }
-    ws.onclose = () => {
-      if (item.running) finish(null)
-    }
-    ws.onerror = () => term.write('\r\n\x1b[31m[连接中断]\x1b[0m\r\n')
-
-    // 面板尺寸变化 → 自适应列行数 → 触发 onResize → 通知远端 PTY
-    const ro = new ResizeObserver(() => {
-      if (host.clientWidth > 0 && host.clientHeight > 0) fit.fit()
-    })
-    ro.observe(host)
-
-    terms.set(item.id, { term, fit, ws, ro })
-  })
+  }
+  // finish 幂等：已收到 exit 则此处无操作；异常断开则标记终态
+  ws.onclose = () => panel.finish(null)
+  ws.onerror = () => panel.termWrite('\r\n\x1b[31m[连接中断]\x1b[0m\r\n')
 }
 
-function disposeTerm(id: number) {
-  const s = terms.get(id)
-  if (!s) return
-  s.ro.disconnect()
-  s.ws.close()
-  s.term.dispose()
-  terms.delete(id)
+/** 终端键入 → 远端 stdin */
+function sendPtyInput(id: number, data: string) {
+  const ws = ptySockets.get(id)
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(enc.encode(data))
 }
 
+/** 终端尺寸变化 → 远端 PTY resize */
+function sendPtyResize(id: number, size: { cols: number; rows: number }) {
+  const ws = ptySockets.get(id)
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: 'resize', cols: size.cols, rows: size.rows }))
+  }
+}
+
+// ---------- 会话关闭 ----------
 function closeRun(id: number) {
   controllers.get(id)?.abort()
   controllers.delete(id)
-  disposeTerm(id)
-  dropRunBuffers(id)
+  ptySockets.get(id)?.close()
+  ptySockets.delete(id)
   const i = runs.findIndex((r) => r.id === id)
-  if (i >= 0) runs.splice(i, 1)
+  if (i >= 0) runs.splice(i, 1) // 面板卸载时组件自清理终端实例
 }
 
 onMounted(load)
 
 onBeforeUnmount(() => {
-  // 离开页面时终止所有仍在执行的流
+  // 离开页面时终止所有仍在执行的会话
   controllers.forEach((c) => c.abort())
   controllers.clear()
-  terms.forEach((_, id) => disposeTerm(id))
+  ptySockets.forEach((ws) => ws.close())
+  ptySockets.clear()
 })
 </script>
 
@@ -410,39 +236,21 @@ onBeforeUnmount(() => {
 
     <p v-if="runs.length === 0" class="empty-tip">暂无执行任务，执行命令后此处将弹出输出面板</p>
 
-    <!-- 输出面板：每次执行一个新面板；PTY 模式渲染 xterm，只读模式 stdout 白 / stderr 红 / 系统提示黄 -->
-    <ToolPanel
+    <!-- 输出面板：展示与终端状态内聚在 ExecPanel，页面只管连接与生命周期 -->
+    <ExecPanel
       v-for="run in runs"
       :key="run.id"
+      :ref="(el) => registerPanel(run.id, el)"
       :title="run.title"
-      :btns="['min', 'close']"
-      :resizable="true"
-      theme="dark"
+      :mode="run.pty ? 'terminal' : 'lines'"
+      :initial-sys-line="run.sysLine"
       class="exec-panel"
       :style="panelStyle(run.id)"
+      @ready="(size) => openPtySession(run, size)"
+      @term-input="(d) => sendPtyInput(run.id, d)"
+      @term-resize="(size) => sendPtyResize(run.id, size)"
       @close="closeRun(run.id)"
-    >
-      <div class="panel-inner">
-        <div v-if="!run.pty" class="run-output" :ref="(el) => registerBody(run.id, el)">
-          <pre
-            v-for="(line, i) in run.lines"
-            :key="i"
-            class="line"
-            :class="`line-${line.kind}`"
-          >{{ line.text }}</pre>
-          <div v-if="!run.finished" class="dim running-tip">运行中…</div>
-        </div>
-        <div v-else class="run-term" :ref="(el) => registerTermHost(run.id, el)"></div>
-        <div v-if="run.finished" class="exit-row">
-          <span class="exit-badge" :class="run.exitCode === 0 ? 'ok' : run.exitCode == null ? 'warn' : 'fail'">
-            退出码: {{ run.exitCode ?? '未知' }}
-          </span>
-          <span v-if="run.timeout" class="exit-badge warn">已超时</span>
-          <span v-if="run.truncated" class="exit-badge warn">输出已截断</span>
-          <span class="dim">耗时 {{ formatDuration(run.durationMs) }}</span>
-        </div>
-      </div>
-    </ToolPanel>
+    />
 
     <!-- 底部任务栏：列出所有面板，支持最小化/还原与右键窗口管理 -->
     <ToolPanelManager v-if="runs.length > 0" theme="dark" mode="horizontal" />
@@ -497,93 +305,9 @@ onBeforeUnmount(() => {
   margin: 12px 0 0;
 }
 
-// 输出面板的初始尺寸（位置由 :style 错开）
-.exec-panel {
+// 输出面板的初始尺寸与位置（class 经 fallthrough 落在组件根 ToolPanel 上）
+:deep(.exec-panel) {
   width: 660px;
   height: 420px;
-}
-
-.panel-inner {
-  height: 100%;
-  display: flex;
-  flex-direction: column;
-  padding: 4px 10px 8px;
-  box-sizing: border-box;
-}
-
-.run-output {
-  flex: 1;
-  min-height: 0;
-  overflow: auto;
-  padding: 4px 2px;
-}
-
-.run-term {
-  flex: 1;
-  min-height: 0;
-
-  :deep(.xterm) {
-    height: 100%;
-  }
-}
-
-.line {
-  margin: 0;
-  white-space: pre-wrap;
-  word-break: break-all;
-  font-family: Consolas, 'JetBrains Mono', monospace;
-  font-size: 13px;
-  line-height: 1.5;
-
-  &.line-stdout {
-    color: #eaeef5; // stdout 白色
-  }
-
-  &.line-stderr {
-    color: var(--stderr); // stderr 红色
-  }
-
-  &.line-sys {
-    color: var(--warning); // 系统提示黄色
-  }
-}
-
-.exit-row {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  margin-top: 10px;
-  padding-top: 8px;
-  border-top: 1px dashed var(--border);
-  font-size: 13px;
-}
-
-.exit-badge {
-  padding: 1px 10px;
-  border-radius: 999px;
-  border: 1px solid transparent;
-
-  &.ok {
-    color: var(--success);
-    border-color: var(--success);
-    background: rgba(52, 211, 153, 0.12);
-  }
-
-  &.fail {
-    color: var(--danger);
-    border-color: var(--danger);
-    background: rgba(248, 113, 113, 0.12);
-  }
-
-  &.warn {
-    color: var(--warning);
-    border-color: var(--warning);
-    background: rgba(251, 191, 36, 0.12);
-  }
-}
-
-.running-tip {
-  margin-top: 8px;
-  font-size: 13px;
 }
 </style>
