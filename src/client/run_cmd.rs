@@ -165,7 +165,7 @@ async fn run_pty_session(
     use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 
     crossterm::terminal::enable_raw_mode().map_err(|e| anyhow!("进入 raw mode 失败: {e}"))?;
-    let _raw = RawModeGuard; // Drop 兜底恢复（显式退出路径已在 exit 前手动关闭）
+    let _raw = RawModeGuard::new(); // Drop 兜底恢复（显式退出路径已在 exit 前手动关闭）
 
     enum InputAction {
         Data(Vec<u8>),
@@ -336,11 +336,80 @@ async fn run_pty_session(
     }
 }
 
-/// raw mode 兜底恢复：正常返回路径经 Drop 关闭；process::exit 路径需在此之前手动关闭
-struct RawModeGuard;
+/// raw mode 兜底恢复：正常返回路径经 Drop 关闭；process::exit 路径需在此之前手动关闭。
+/// Windows 下额外持有 conhost 环境开启 VT 处理前的 stdout 模式，Drop 时一并恢复。
+struct RawModeGuard {
+    /// 非 WT 环境（conhost）开启 ENABLE_VIRTUAL_TERMINAL_PROCESSING 前的原模式；None = 未改动
+    #[cfg(windows)]
+    vt_mode: Option<u32>,
+}
+
+impl RawModeGuard {
+    fn new() -> Self {
+        #[cfg(windows)]
+        {
+            let vt_mode = match std::env::var_os("WT_SESSION") {
+                Some(_) => None, // Windows Terminal 默认支持 VT 处理，非 conhost、PowerShell 等环境，无需开启 VT 处理
+                None => {
+                    crate::dlog!("[pty] WT 环境检测：未检测到 Windows Terminal 会话 WT_SESSION，尝试开启 VT 处理");
+                    match enable_vt_processing() {
+                        Some(mode) => {
+                            crate::dlog!("[pty] WT 环境检测：VT 处理已开启，原控制台模式={mode}");
+                            Some(mode)
+                        }
+                        None => {
+                            crate::dlog!("[pty] WT 环境检测：VT 处理开启失败，或已默认开启");
+                            None
+                        }
+                    }
+                }
+            };
+            RawModeGuard { vt_mode }
+        }
+        #[cfg(not(windows))]
+        RawModeGuard {}
+    }
+}
+
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let _ = crossterm::terminal::disable_raw_mode();
+        #[cfg(windows)]
+        if let Some(mode) = self.vt_mode {
+            restore_console_mode(mode);
+        }
+    }
+}
+
+/// 非 Windows Terminal（conhost 等）宿主下，stdout 的 VT 处理默认可能未开启，
+/// 远端输出的 ANSI 序列会以 `ESC[...` 字面量形式显示为乱码。为 stdout 开启
+/// ENABLE_VIRTUAL_TERMINAL_PROCESSING，返回原控制台模式供 Drop 恢复。
+#[cfg(windows)]
+fn enable_vt_processing() -> Option<u32> {
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+        STD_OUTPUT_HANDLE,
+    };
+    unsafe {
+        let h = GetStdHandle(STD_OUTPUT_HANDLE);
+        let mut mode = 0u32;
+        if GetConsoleMode(h, &mut mode) == 0 {
+            return None;
+        }
+        if SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) == 0 {
+            return None;
+        }
+        Some(mode)
+    }
+}
+
+/// 恢复 stdout 控制台模式（Drop 路径，失败只能静默）
+#[cfg(windows)]
+fn restore_console_mode(mode: u32) {
+    use windows_sys::Win32::System::Console::{GetStdHandle, SetConsoleMode, STD_OUTPUT_HANDLE};
+    unsafe {
+        let h = GetStdHandle(STD_OUTPUT_HANDLE);
+        let _ = SetConsoleMode(h, mode);
     }
 }
 

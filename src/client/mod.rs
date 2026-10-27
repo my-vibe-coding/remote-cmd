@@ -31,6 +31,7 @@ pub async fn start() -> anyhow::Result<()> {
         move |req: Request, next: Next| host_allowlist(port, req, next),
     ));
     macro_log::i!("remote-cmd 客户端已启动: {}", url);
+    macro_log::i!("Tip: 客户端相当于一个配置管理工具，脚本生成后，关闭本程序也可以执行");
     let _ = open::that(url);
 
     axum::serve(listener, app).await?;
