@@ -155,10 +155,10 @@ onMounted(async () => {
         <div class="info-item"><span class="dim">操作系统</span><span>{{ info.os }}</span></div>
         <div class="info-item"><span class="dim">当前用户</span><span>{{ info.user }}</span></div>
       </div>
-      <p v-else-if="info === null" class="empty-tip">
+      <div v-else-if="info === null" class="empty-tip">
         <div>获取客户端信息失败, 程序是否以服务模式运行? </div>
         <div>访问 <a href="/admin" style="color: #007bff;">服务端</a> 页面</div>
-      </p>
+      </div>
       <p v-else-if="info === undefined" class="empty-tip">正在获取客户端信息…</p>
     </section>
 

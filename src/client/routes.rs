@@ -3,7 +3,8 @@ use std::convert::Infallible;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use axum::extract::{Path, Query, Request};
+use axum::extract::{Path, Query, RawQuery, Request};
+use axum::extract::ws::{WebSocket, WebSocketUpgrade};
 use axum::http::{StatusCode, Uri};
 use axum::response::Response;
 use axum::routing::{delete, get, post};
@@ -27,6 +28,7 @@ pub fn router() -> Router {
         .route("/api/local/aliases/{name}/script", delete(delete_alias_script))
         .route("/api/local/script/reveal", post(reveal_script))
         .route("/api/local/exec", post(exec))
+        .route("/api/local/exec-pty", get(exec_pty))
         .route("/api/local/script", post(gen_script))
         .fallback(local_static)
         .with_state(())
@@ -416,11 +418,12 @@ async fn exec(Json(body): Json<ExecBody>) -> Result<Response, (StatusCode, Strin
                 Some(Ok(frame)) => match crate::client::remote::parse_frame(frame) {
                     Some(crate::client::remote::ExecFrame::Output { stream: s, data }) => {
                         let data_b64 = base64::engine::general_purpose::STANDARD.encode(data);
-                        let json = serde_json::json!({ "stream": s, "data_b64": data_b64 });
+                        let json = serde_json::json!({ "type": "output", "stream": s, "data_b64": data_b64 });
                         return Some((Ok::<_, std::convert::Infallible>(Event::default().event("output").data(json.to_string())), stream));
                     }
                     Some(crate::client::remote::ExecFrame::Exit { exit_code, timeout, duration_ms, truncated }) => {
                         let json = serde_json::json!({
+                            "type": "exit",
                             "exit_code": exit_code, "timeout": timeout,
                             "duration_ms": duration_ms, "truncated": truncated,
                         });
@@ -433,6 +436,193 @@ async fn exec(Json(body): Json<ExecBody>) -> Result<Response, (StatusCode, Strin
         }
     });
     Ok(Sse::new(stream).keep_alive(KeepAlive::default()).into_response())
+}
+
+// ---- Web 交互终端（xterm）WS 桥 ----
+
+/// 桥接层应用心跳：防 NAT/代理静默掐断空闲桥接
+const BRIDGE_PING_INTERVAL: Duration = Duration::from_secs(30);
+
+#[derive(Deserialize)]
+struct ExecPtyQuery {
+    alias: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    cols: Option<u16>,
+    #[serde(default)]
+    rows: Option<u16>,
+}
+
+/// Web 交互执行：浏览器 xterm.js ↔ 本地客户端 WS 桥 ↔ 远端 PTY 会话（与 CLI PTY 链路一致）。
+/// 协议（浏览器 → 本地）：
+/// - Binary 帧 = stdin 原始字节
+/// - Text 帧   = 控制消息，仅支持 `{"type":"resize","cols":C,"rows":R}`
+/// 协议（本地 → 浏览器）：
+/// - Binary 帧 = PTY 原始输出（xterm.js 直接 write）
+/// - Text 帧   = `{"type":"error",...}` 建链失败 / `{"type":"exit",...}` 终态（随后关闭）
+async fn exec_pty(
+    RawQuery(raw): RawQuery,
+    ws: WebSocketUpgrade,
+) -> Result<Response, (StatusCode, String)> {
+    // 升级前完成别名解析/参数校验，错误可以 HTTP 状态码返回给前端。
+    // 注意不能用 axum Query（serde_urlencoded 不支持重复键 → Vec<String>），
+    // args 以 `args=a&args=b` 形式出现时会被整体拒绝导致 WS 握手 400，故用 serde_html_form 解析。
+    let q: ExecPtyQuery = serde_html_form::from_str(raw.as_deref().unwrap_or_default())
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("查询参数无效: {e}")))?;
+    let (server, payload) = crate::client::run_cmd::resolve_exec_target(&q.alias, &q.args)
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let program = payload["program"].as_str().unwrap_or_default().to_string();
+    let args: Vec<String> = serde_json::from_value(payload["args"].clone())
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    let tty_size = match (q.cols, q.rows) {
+        (Some(c), Some(r)) if c > 0 && r > 0 => Some((c, r)),
+        _ => None,
+    };
+    Ok(ws.on_upgrade(move |socket| exec_pty_bridge(socket, server, program, args, tty_size)))
+}
+
+/// 双向泵：select 浏览器 WS 与远端执行 WS，任一侧结束即整桥拆除
+///（浏览器断开 → 远端 WS 关闭，服务端按断连终止子进程，与 CLI 脱离语义一致）。
+async fn exec_pty_bridge(
+    browser: WebSocket,
+    server: ServerReg,
+    program: String,
+    args: Vec<String>,
+    tty_size: Option<(u16, u16)>,
+) {
+    use crate::client::remote::{ExecFrame, ExecWs, parse_frame, resize_msg};
+    use futures::{SinkExt as _, StreamExt as _};
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    let token = server.token.clone().unwrap_or_default();
+    let ExecWs { sink: mut rtx, stream: mut rrx } =
+        match crate::client::remote::ws_exec(
+            &server.server_url,
+            &token,
+            &program,
+            &args,
+            None, // PTY 会话：无超时（与 CLI 交互会话一致）
+            true,
+            tty_size,
+            server.cert_sha256.as_deref(),
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                crate::dlog!("[exec-pty] 远端会话建立失败: {e}");
+                let mut b = browser;
+                let _ = b.send(axum::extract::ws::Message::Text(
+                    serde_json::json!({ "type": "error", "message": format!("建立远端会话失败: {e}") })
+                        .to_string()
+                        .into(),
+                ))
+                .await;
+                let _ = b.close().await;
+                return;
+            }
+        };
+    let (mut btx, mut brx) = browser.split();
+    let mut ping = tokio::time::interval(BRIDGE_PING_INTERVAL);
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            // 浏览器 → 远端
+            msg = brx.next() => match msg {
+                Some(Ok(axum::extract::ws::Message::Binary(b))) => {
+                    if rtx.send(WsMessage::Binary(b.into())).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Ok(axum::extract::ws::Message::Text(t))) => {
+                    // 控制消息：仅 resize（缺字段/非法值静默忽略）
+                    let dims = serde_json::from_str::<serde_json::Value>(&t)
+                        .ok()
+                        .and_then(|v| {
+                            if v["type"] != "resize" {
+                                return None;
+                            }
+                            let dim = |x: &serde_json::Value| {
+                                x.as_u64().and_then(|n| u16::try_from(n).ok()).filter(|n| *n > 0)
+                            };
+                            Some((dim(&v["cols"])?, dim(&v["rows"])?))
+                        });
+                    if let Some((c, r)) = dims {
+                        if rtx.send(resize_msg(c, r)).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+                Some(Ok(axum::extract::ws::Message::Close(_))) | None => break,
+                Some(Ok(_)) => {} // Ping/Pong 由底层协议处理
+                Some(Err(e)) => {
+                    crate::dlog!("[exec-pty] 浏览器 WS 错误: {e}");
+                    break;
+                }
+            },
+            // 远端 → 浏览器
+            frame = rrx.next() => match frame {
+                Some(Ok(frame)) => match parse_frame(frame) {
+                    Some(ExecFrame::Output { data, .. }) => {
+                        // PTY 模式 stdout/stderr 已合并，原样转发字节给 xterm
+                        if btx.send(axum::extract::ws::Message::Binary(data.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(ExecFrame::Exit { exit_code, timeout, duration_ms, truncated }) => {
+                        let json = serde_json::json!({
+                            "type": "exit", "exit_code": exit_code, "timeout": timeout,
+                            "duration_ms": duration_ms, "truncated": truncated,
+                        });
+                        let _ = btx.send(axum::extract::ws::Message::Text(json.to_string().into())).await;
+                        let _ = btx.close().await;
+                        break;
+                    }
+                    None => {}
+                },
+                Some(Err(e)) => {
+                    crate::dlog!("[exec-pty] 远端 WS 错误: {e}");
+                    break;
+                }
+                None => break,
+            },
+            // 应用层心跳：只 ping 浏览器侧（远端侧 ws_exec 会话有心跳由运行层维护）
+            _ = ping.tick() => {
+                if btx.send(axum::extract::ws::Message::Ping(Vec::new().into())).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    let _ = btx.close().await;
+    let _ = rtx.close().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ExecPtyQuery;
+
+    /// 回归：args 以重复键 `args=a&args=b` 出现时必须能解析。
+    /// axum Query（serde_urlencoded）不支持序列类型，遇到 args 键会整体拒绝 → WS 握手 400，
+    /// 故 exec_pty 使用 serde_html_form 解析（支持重复键与 '+' 空格语义）。
+    #[test]
+    fn exec_pty_query_parses_repeated_args() {
+        let q: ExecPtyQuery =
+            serde_html_form::from_str("alias=bash&cols=80&rows=24&args=-c&args=echo+hi").unwrap();
+        assert_eq!(q.alias, "bash");
+        assert_eq!(q.args, vec!["-c".to_string(), "echo hi".to_string()]);
+        assert_eq!(q.cols, Some(80));
+        assert_eq!(q.rows, Some(24));
+    }
+
+    #[test]
+    fn exec_pty_query_without_args() {
+        let q: ExecPtyQuery = serde_html_form::from_str("alias=bash&cols=80&rows=24").unwrap();
+        assert!(q.args.is_empty());
+        assert_eq!(q.alias, "bash");
+    }
 }
 
 #[derive(Deserialize)]

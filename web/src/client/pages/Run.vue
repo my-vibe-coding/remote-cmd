@@ -1,6 +1,9 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { ToolPanel, ToolPanelManager } from '@develon/webui-panel'
+import { Terminal } from '@xterm/xterm'
+import { FitAddon } from '@xterm/addon-fit'
+import '@xterm/xterm/css/xterm.css'
 import { ApiError, localApi, type AliasDefInfo, type ServerRegInfo } from '../../shared/api'
 import {
   consumeSse,
@@ -29,6 +32,8 @@ interface RunItem {
   timeout: boolean
   truncated: boolean
   durationMs: number | null
+  /** 交互模式：xterm 渲染 + WS PTY 桥；否则为 SSE 只读流 */
+  pty: boolean
 }
 
 const aliases = ref<Record<string, AliasDefInfo>>({})
@@ -36,6 +41,8 @@ const servers = ref<ServerRegInfo[]>([])
 const alias = ref('')
 const argsText = ref('')
 const formError = ref('')
+/** 交互模式开关（PTY 终端）；关闭则走 SSE 只读流 */
+const ptyMode = ref(true)
 const runs = reactive<RunItem[]>([])
 let nextId = 1
 
@@ -175,22 +182,30 @@ async function run() {
     id: nextId++,
     title: `${alias.value} · ${nowShort()}`,
     alias: alias.value,
-    lines: [
-      {
-        kind: 'sys',
-        text: `▶ ${serverLabel ? `[${serverLabel}] ` : ''}${alias.value}${args.length ? ' ' + args.join(' ') : ''}`,
-      },
-    ],
+    lines: [],
     running: true,
     finished: false,
     exitCode: null,
     timeout: false,
     truncated: false,
     durationMs: null,
+    pty: ptyMode.value,
   })
+  if (!item.pty) {
+    item.lines.push({
+      kind: 'sys',
+      text: `▶ ${serverLabel ? `[${serverLabel}] ` : ''}${alias.value}${args.length ? ' ' + args.join(' ') : ''}`,
+    })
+  }
   runs.push(item)
   argsText.value = ''
 
+  if (item.pty) startPty(item, args)
+  else startSse(item, args)
+}
+
+/** SSE 只读流（管道模式，无 stdin 交互） */
+async function startSse(item: RunItem, args: string[]) {
   const controller = new AbortController()
   controllers.set(item.id, controller)
 
@@ -239,9 +254,115 @@ async function run() {
   }
 }
 
+// ---------- 交互终端（xterm + WS PTY 桥） ----------
+
+interface TermSession {
+  term: Terminal
+  fit: FitAddon
+  ws: WebSocket
+  ro: ResizeObserver
+}
+const terms = new Map<number, TermSession>()
+const termHosts = new Map<number, HTMLElement>()
+
+function registerTermHost(id: number, el: unknown) {
+  if (el instanceof HTMLElement) termHosts.set(id, el)
+  else termHosts.delete(id)
+}
+
+/** PTY 交互模式：xterm 渲染远端输出，键入/resize 经 WS 桥转发（协议见 routes.rs exec_pty） */
+function startPty(item: RunItem, args: string[]) {
+  void nextTick(() => {
+    const host = termHosts.get(item.id)
+    if (!host) {
+      item.running = false
+      item.finished = true
+      item.lines.push({ kind: 'stderr', text: '终端容器未就绪' })
+      return
+    }
+    const term = new Terminal({
+      fontFamily: "Consolas, 'JetBrains Mono', monospace",
+      fontSize: 13,
+      cursorBlink: true,
+      theme: { background: '#1f232b', foreground: '#e3e7ef', cursor: '#27c2dc' },
+    })
+    const fit = new FitAddon()
+    term.loadAddon(fit)
+    term.open(host)
+    if (host.clientWidth > 0) fit.fit()
+
+    const qs = new URLSearchParams()
+    qs.set('alias', item.alias)
+    for (const a of args) qs.append('args', a)
+    qs.set('cols', String(term.cols))
+    qs.set('rows', String(term.rows))
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws'
+    const ws = new WebSocket(`${proto}://${location.host}/api/local/exec-pty?${qs}`)
+    ws.binaryType = 'arraybuffer'
+
+    const enc = new TextEncoder()
+    term.onData((d) => {
+      if (ws.readyState === WebSocket.OPEN) ws.send(enc.encode(d))
+    })
+    term.onResize(({ cols, rows }) => {
+      if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'resize', cols, rows }))
+    })
+
+    const finish = (payload: ExecExitPayload | null) => {
+      item.running = false
+      item.finished = true
+      if (payload) {
+        item.exitCode = payload.exit_code
+        item.timeout = payload.timeout
+        item.durationMs = payload.duration_ms
+        item.truncated = item.truncated || payload.truncated
+      }
+    }
+
+    ws.onmessage = (e) => {
+      if (typeof e.data === 'string') {
+        try {
+          const v = JSON.parse(e.data)
+          if (v.type === 'exit') finish(v as ExecExitPayload)
+          else if (v.type === 'error') {
+            term.write(`\r\n\x1b[31m${v.message ?? '连接失败'}\x1b[0m\r\n`)
+            finish(null)
+          }
+        } catch {
+          /* 忽略非 JSON 文本帧 */
+        }
+      } else {
+        term.write(new Uint8Array(e.data as ArrayBuffer))
+      }
+    }
+    ws.onclose = () => {
+      if (item.running) finish(null)
+    }
+    ws.onerror = () => term.write('\r\n\x1b[31m[连接中断]\x1b[0m\r\n')
+
+    // 面板尺寸变化 → 自适应列行数 → 触发 onResize → 通知远端 PTY
+    const ro = new ResizeObserver(() => {
+      if (host.clientWidth > 0 && host.clientHeight > 0) fit.fit()
+    })
+    ro.observe(host)
+
+    terms.set(item.id, { term, fit, ws, ro })
+  })
+}
+
+function disposeTerm(id: number) {
+  const s = terms.get(id)
+  if (!s) return
+  s.ro.disconnect()
+  s.ws.close()
+  s.term.dispose()
+  terms.delete(id)
+}
+
 function closeRun(id: number) {
   controllers.get(id)?.abort()
   controllers.delete(id)
+  disposeTerm(id)
   dropRunBuffers(id)
   const i = runs.findIndex((r) => r.id === id)
   if (i >= 0) runs.splice(i, 1)
@@ -253,6 +374,7 @@ onBeforeUnmount(() => {
   // 离开页面时终止所有仍在执行的流
   controllers.forEach((c) => c.abort())
   controllers.clear()
+  terms.forEach((_, id) => disposeTerm(id))
 })
 </script>
 
@@ -273,10 +395,14 @@ onBeforeUnmount(() => {
           placeholder="参数（以空格分隔，可留空）"
           @keyup.enter="run"
         />
+        <label class="pty-toggle dim">
+          <input v-model="ptyMode" type="checkbox" /> 交互终端
+        </label>
         <button class="btn btn-primary" :disabled="!alias" @click="run">执行</button>
       </div>
       <p class="dim tip">
         参数将按空格拆分后传给后端，替换模板中的 <code>{args}</code> 占位符。
+        交互终端模式下可实时键入（vim/top 等全屏程序可用），关闭则走只读流式输出。
         每次执行会新开一个输出面板，可同时运行多个命令互不干扰；面板支持拖拽、缩放，最小化后可从底部任务栏恢复。
       </p>
       <p v-if="formError" class="error-text">{{ formError }}</p>
@@ -284,7 +410,7 @@ onBeforeUnmount(() => {
 
     <p v-if="runs.length === 0" class="empty-tip">暂无执行任务，执行命令后此处将弹出输出面板</p>
 
-    <!-- 输出面面板：每次执行一个新面板，stdout 白 / stderr 红 / 系统提示黄 -->
+    <!-- 输出面板：每次执行一个新面板；PTY 模式渲染 xterm，只读模式 stdout 白 / stderr 红 / 系统提示黄 -->
     <ToolPanel
       v-for="run in runs"
       :key="run.id"
@@ -296,8 +422,17 @@ onBeforeUnmount(() => {
       :style="panelStyle(run.id)"
       @close="closeRun(run.id)"
     >
-      <div class="run-output" :ref="(el) => registerBody(run.id, el)">
-        <pre v-for="(line, i) in run.lines" :key="i" class="line" :class="`line-${line.kind}`">{{ line.text }}</pre>
+      <div class="panel-inner">
+        <div v-if="!run.pty" class="run-output" :ref="(el) => registerBody(run.id, el)">
+          <pre
+            v-for="(line, i) in run.lines"
+            :key="i"
+            class="line"
+            :class="`line-${line.kind}`"
+          >{{ line.text }}</pre>
+          <div v-if="!run.finished" class="dim running-tip">运行中…</div>
+        </div>
+        <div v-else class="run-term" :ref="(el) => registerTermHost(run.id, el)"></div>
         <div v-if="run.finished" class="exit-row">
           <span class="exit-badge" :class="run.exitCode === 0 ? 'ok' : run.exitCode == null ? 'warn' : 'fail'">
             退出码: {{ run.exitCode ?? '未知' }}
@@ -306,7 +441,6 @@ onBeforeUnmount(() => {
           <span v-if="run.truncated" class="exit-badge warn">输出已截断</span>
           <span class="dim">耗时 {{ formatDuration(run.durationMs) }}</span>
         </div>
-        <div v-else class="dim running-tip">运行中…</div>
       </div>
     </ToolPanel>
 
@@ -333,6 +467,15 @@ onBeforeUnmount(() => {
   align-items: center;
 }
 
+.pty-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  cursor: pointer;
+  user-select: none;
+}
+
 .grow {
   flex: 1;
 }
@@ -355,15 +498,33 @@ onBeforeUnmount(() => {
 }
 
 // 输出面板的初始尺寸（位置由 :style 错开）
-:deep(.exec-panel) {
+.exec-panel {
   width: 660px;
   height: 420px;
 }
 
-.run-output {
+.panel-inner {
   height: 100%;
+  display: flex;
+  flex-direction: column;
+  padding: 4px 10px 8px;
+  box-sizing: border-box;
+}
+
+.run-output {
+  flex: 1;
+  min-height: 0;
   overflow: auto;
   padding: 4px 2px;
+}
+
+.run-term {
+  flex: 1;
+  min-height: 0;
+
+  :deep(.xterm) {
+    height: 100%;
+  }
 }
 
 .line {
