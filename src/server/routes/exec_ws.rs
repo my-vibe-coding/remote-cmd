@@ -5,7 +5,6 @@ use std::time::Duration;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, State};
 use axum::response::Response;
-use base64::Engine;
 use futures::{SinkExt, StreamExt};
 use serde::Deserialize;
 
@@ -224,15 +223,14 @@ async fn read_init(socket: &mut WebSocket) -> Result<WsInit, String> {
 /// exec 事件 → WS 帧：stdout=0x01 / stderr=0x02 / 截断标记=0x03；Exit 为 Text JSON
 fn event_message(ev: &ExecEvent) -> Message {
     match ev {
-        ExecEvent::Output { stream, data_b64 } => {
+        ExecEvent::Output { stream, data } => {
             if *stream == "__truncated__" {
                 return Message::Binary(vec![3].into());
             }
-            let bytes = base64::engine::general_purpose::STANDARD.decode(data_b64).unwrap_or_default();
             let tag: u8 = if *stream == "stderr" { 2 } else { 1 };
-            let mut frame = Vec::with_capacity(1 + bytes.len());
+            let mut frame = Vec::with_capacity(1 + data.len());
             frame.push(tag);
-            frame.extend_from_slice(&bytes);
+            frame.extend_from_slice(data);
             Message::Binary(frame.into())
         }
         ExecEvent::Exit { .. } => Message::Text(serde_json::to_string(ev).unwrap_or_default().into()),

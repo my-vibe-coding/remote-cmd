@@ -2,7 +2,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use base64::Engine;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
@@ -30,7 +29,7 @@ pub struct ExecRequest {
 pub enum ExecEvent {
     Output {
         stream: &'static str,
-        data_b64: String,
+        data: Vec<u8>,
     },
     Exit {
         exit_code: Option<i32>,
@@ -226,7 +225,7 @@ async fn pump<R: tokio::io::AsyncRead + Unpin>(
                 // 冲刷转码器尾部（未完成的多字节序列）
                 let tail = transcoder.feed(&[], true);
                 if !tail.is_empty() {
-                    let _ = send_output(&tx, stream, tail.as_bytes()).await;
+                    let _ = send_output(&tx, stream, tail.into_bytes()).await;
                 }
                 break;
             }
@@ -238,14 +237,14 @@ async fn pump<R: tokio::io::AsyncRead + Unpin>(
                         let _ = tx
                             .send(ExecEvent::Output {
                                 stream: "__truncated__",
-                                data_b64: String::new(),
+                                data: Vec::new(),
                             })
                             .await;
                     }
                     continue;
                 }
                 let text = transcoder.feed(&buf[..n], false);
-                if !send_output(&tx, stream, text.as_bytes()).await {
+                if !send_output(&tx, stream, text.into_bytes()).await {
                     // 接收端关闭（客户端断连）
                     break;
                 }
@@ -254,18 +253,10 @@ async fn pump<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
-async fn send_output(
-    tx: &mpsc::Sender<ExecEvent>,
-    stream: &'static str,
-    bytes: &[u8],
-) -> bool {
-    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
-    tx.send(ExecEvent::Output {
-        stream,
-        data_b64: b64,
-    })
-    .await
-    .is_ok()
+async fn send_output(tx: &mpsc::Sender<ExecEvent>, stream: &'static str, bytes: Vec<u8>) -> bool {
+    tx.send(ExecEvent::Output { stream, data: bytes })
+        .await
+        .is_ok()
 }
 
 /// 子进程输出转码器：Windows 控制台程序多以 OEM 代码页（中文系统为 GBK/cp936）输出，
@@ -593,7 +584,6 @@ async fn run_pty(
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    pass.clear();
                     for &b in &buf[..n] {
                         match scan {
                             ScanState::Normal => {
@@ -681,13 +671,15 @@ async fn run_pty(
                         }
                     }
                     if !pass.is_empty() {
-                        let b64 = base64::engine::general_purpose::STANDARD.encode(&pass);
+                        // take 出整块数据发送，重建缓冲保留容量
+                        let out = std::mem::take(&mut pass);
                         if tx_reader
-                            .blocking_send(ExecEvent::Output { stream: "pty", data_b64: b64 })
+                            .blocking_send(ExecEvent::Output { stream: "pty", data: out })
                             .is_err()
                         {
                             break;
                         }
+                        pass = Vec::with_capacity(buf.len());
                     }
                 }
             }
@@ -826,10 +818,8 @@ mod tests {
         let mut exit_code = None;
         while let Some(ev) = rx.recv().await {
             match ev {
-                ExecEvent::Output { stream, data_b64 } if stream == "stdout" => {
-                    stdout.push_str(&String::from_utf8_lossy(
-                        &base64::engine::general_purpose::STANDARD.decode(&data_b64).unwrap_or_default(),
-                    ));
+                ExecEvent::Output { stream, data } if stream == "stdout" => {
+                    stdout.push_str(&String::from_utf8_lossy(&data));
                 }
                 ExecEvent::Exit { exit_code: c, .. } => {
                     exit_code = c;
@@ -866,10 +856,8 @@ mod tests {
         let completed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
             while let Some(ev) = rx.recv().await {
                 match ev {
-                    ExecEvent::Output { data_b64, .. } => {
-                        output.push_str(&String::from_utf8_lossy(
-                            &base64::engine::general_purpose::STANDARD.decode(&data_b64).unwrap_or_default(),
-                        ));
+                    ExecEvent::Output { data, .. } => {
+                        output.push_str(&String::from_utf8_lossy(&data));
                     }
                     ExecEvent::Exit { exit_code: c, .. } => {
                         exit_code = c;

@@ -6,6 +6,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::Bytes;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{
     connect_async_tls_with_config, Connector, MaybeTlsStream, WebSocketStream,
@@ -47,7 +48,7 @@ pub struct ExecWs {
 /// 服务端 → 客户端的执行事件帧
 #[derive(Debug)]
 pub enum ExecFrame {
-    Output { stream: &'static str, data: Vec<u8> },
+    Output { stream: &'static str, data: Bytes },
     Exit { exit_code: Option<i32>, timeout: bool, duration_ms: u64, truncated: bool },
 }
 
@@ -233,13 +234,14 @@ pub async fn ws_exec(
     }
 }
 
-/// WS 帧 → 执行事件；无法识别的帧返回 None
+/// WS 帧 → 执行事件；无法识别的帧返回 None。
+/// Binary 帧用 Bytes 零拷贝切片（去除 tag 字节），避免每帧一次 to_vec 拷贝。
 pub fn parse_frame(msg: WsMessage) -> Option<ExecFrame> {
     match msg {
         WsMessage::Binary(data) if !data.is_empty() => match data[0] {
-            1 => Some(ExecFrame::Output { stream: "stdout", data: data[1..].to_vec() }),
-            2 => Some(ExecFrame::Output { stream: "stderr", data: data[1..].to_vec() }),
-            3 => Some(ExecFrame::Output { stream: "__truncated__", data: vec![] }),
+            1 => Some(ExecFrame::Output { stream: "stdout", data: data.slice(1..) }),
+            2 => Some(ExecFrame::Output { stream: "stderr", data: data.slice(1..) }),
+            3 => Some(ExecFrame::Output { stream: "__truncated__", data: data.slice(1..) }),
             _ => None,
         },
         WsMessage::Text(t) => {
