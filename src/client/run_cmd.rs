@@ -9,6 +9,9 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use super::config::{load_aliases, render_template, ClientConfig, ServerReg};
 use super::remote::{parse_frame, resize_msg, ws_exec, ExecFrame, ExecWs, STDIN_CLOSE};
 
+/// WS 心跳间隔：空闲会话周期发 Ping，防 NAT/代理静默掐断长连接
+const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// `remote-cmd run <别名> [args...]`：读取本地配置 → 模板渲染 → WS 会话 → stdin 转发 + 流式输出 → 透传退出码
 pub async fn run(alias: &str, args: &[String]) -> Result<()> {
     let (server, body) = resolve_exec_target(alias, args)?;
@@ -107,14 +110,24 @@ fn spawn_stdin_pump(
         }
     });
     tokio::spawn(async move {
-        while let Some(data) = rx.recv().await {
-            if sink.send(WsMessage::Binary(data.into())).await.is_err() {
+        let mut ping = tokio::time::interval(PING_INTERVAL);
+        loop {
+            let msg = tokio::select! {
+                data = rx.recv() => match data {
+                    Some(data) => WsMessage::Binary(data.into()),
+                    None => {
+                        // 本地 EOF → 通知服务端关闭子进程 stdin
+                        let _ = sink.send(WsMessage::Text(STDIN_CLOSE.into())).await;
+                        let _ = reader.await;
+                        return;
+                    }
+                },
+                _ = ping.tick() => WsMessage::Ping(vec![].into()),
+            };
+            if sink.send(msg).await.is_err() {
                 return;
             }
         }
-        // 本地 EOF → 通知服务端关闭子进程 stdin
-        let _ = sink.send(WsMessage::Text(STDIN_CLOSE.into())).await;
-        let _ = reader.await;
     })
 }
 
@@ -160,42 +173,48 @@ async fn run_pty_session(
         }
     });
 
-    // 输入转发任务：本地事件 → WS 帧（经 ReplyFilter 吞掉终端应答序列）；Detach 时通知主循环断开
+    // 输入转发任务：本地事件 → WS 帧（经 ReplyFilter 吞掉终端应答序列）；Detach 时通知主循环断开。
+    // 空闲时周期发 Ping 心跳，防 NAT/代理静默掐断空闲 PTY 会话（axum 服务端自动回 Pong）。
     let (detach_tx, mut detach_rx) = mpsc::channel::<()>(1);
     let mut reply_filter = ReplyFilter::new();
     let forward = tokio::spawn(async move {
-        while let Some(a) = irx.recv().await {
-            let msg = match a {
-                InputAction::Data(d) => match reply_filter.feed(&d) {
-                    filtered if filtered.is_empty() && !d.is_empty() => {
-                        crate::dlog!(
-                            "[pty-in] 客户端过滤器吞掉本地应答 {} 字节: {}",
-                            d.len(),
-                            crate::common::escape_bytes(&d)
-                        );
-                        continue; // 终端应答被吞掉，不转发远端
-                    }
-                    filtered => {
-                        if !d.is_empty() {
+        let mut ping = tokio::time::interval(PING_INTERVAL);
+        loop {
+            let msg = tokio::select! {
+                a = irx.recv() => match a {
+                    None => break,
+                    Some(InputAction::Data(d)) => match reply_filter.feed(&d) {
+                        filtered if filtered.is_empty() && !d.is_empty() => {
                             crate::dlog!(
-                                "[pty-in] 客户端输入 {} 字节 -> 转发 {} 字节: {}",
+                                "[pty-in] 客户端过滤器吞掉本地应答 {} 字节: {}",
                                 d.len(),
-                                filtered.len(),
-                                crate::common::escape_bytes(&filtered)
+                                crate::common::escape_bytes(&d)
                             );
+                            continue; // 终端应答被吞掉，不转发远端
                         }
-                        WsMessage::Binary(filtered.into())
+                        filtered => {
+                            if !d.is_empty() {
+                                crate::dlog!(
+                                    "[pty-in] 客户端输入 {} 字节 -> 转发 {} 字节: {}",
+                                    d.len(),
+                                    filtered.len(),
+                                    crate::common::escape_bytes(&filtered)
+                                );
+                            }
+                            WsMessage::Binary(filtered.into())
+                        }
+                    },
+                    Some(InputAction::Resize(c, r)) => {
+                        crate::dlog!("[pty-in] 客户端上报终端尺寸 {}x{}", c, r);
+                        resize_msg(c, r)
+                    }
+                    Some(InputAction::Detach) => {
+                        crate::dlog!("[pty-in] 客户端脱离会话（Ctrl+]）");
+                        let _ = detach_tx.send(()).await;
+                        break;
                     }
                 },
-                InputAction::Resize(c, r) => {
-                    crate::dlog!("[pty-in] 客户端上报终端尺寸 {}x{}", c, r);
-                    resize_msg(c, r)
-                }
-                InputAction::Detach => {
-                    crate::dlog!("[pty-in] 客户端脱离会话（Ctrl+]）");
-                    let _ = detach_tx.send(()).await;
-                    break;
-                }
+                _ = ping.tick() => WsMessage::Ping(vec![].into()),
             };
             if sink.send(msg).await.is_err() {
                 break;
