@@ -340,7 +340,8 @@ impl ReplyFilter {
                         || matches!(b, b';' | b'?' | b'>' | b'<' | b'=' | b':' | b'$')
                     {
                         self.pending.push(b);
-                        if self.pending.len() >= 32 {
+                        if self.pending.len() >= 64 {
+                            // 异常超长（非完整应答）：放行防卡死（与 Csi 态上限一致）
                             out.append(&mut self.pending);
                             self.state = FilterState::Normal;
                         }
@@ -547,6 +548,16 @@ mod tests {
         // 混合：应答后接普通输入
         let mut f = ReplyFilter::new();
         assert_eq!(f.feed(b"[10;1Rls"), b"ls");
+    }
+
+    /// 长应答（无 ESC 前缀、参数 ≥32 字节的实测 WT DA1 形态）应被完整吞掉
+    #[test]
+    fn reply_filter_swallows_long_naked_reply() {
+        let mut f = ReplyFilter::new();
+        // 实测乱码本体：参数 "?61;4;6;7;14;21;22;23;24;28;32;42;52" 达 36 字节
+        for b in b"[?61;4;6;7;14;21;22;23;24;28;32;42;52c" {
+            assert_eq!(f.feed(&[*b]), b"");
+        }
     }
 
     /// vim 的 [ 类按键（[c/[d/[Z）不应被误吞
