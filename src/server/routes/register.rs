@@ -16,8 +16,11 @@ pub struct RegisterResponse {
     pub status: ClientStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// 客户端记录的 hostname（echo 语义，已存在记录时回显）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
+    /// 服务器自身主机名：客户端存为该服务器的显示名（区别于 hostname 字段）
+    pub server_hostname: String,
 }
 
 /// POST /api/register：指纹幂等的注册申请/凭证领取
@@ -58,6 +61,7 @@ pub async fn register(
                 status: ClientStatus::Pending,
                 token: None,
                 hostname: Some(record.hostname),
+                server_hostname: state.server_hostname.clone(),
             }));
         }
         state
@@ -69,6 +73,7 @@ pub async fn register(
             status,
             token: existing.token,
             hostname: Some(existing.hostname),
+            server_hostname: state.server_hostname.clone(),
         }));
     }
 
@@ -101,6 +106,7 @@ pub async fn register(
         status: ClientStatus::Pending,
         token: None,
         hostname: None,
+        server_hostname: state.server_hostname.clone(),
     }))
 }
 
@@ -149,6 +155,7 @@ pub async fn status(
         status: record.status,
         token: None,
         hostname: Some(record.hostname),
+        server_hostname: state.server_hostname.clone(),
     }))
 }
 

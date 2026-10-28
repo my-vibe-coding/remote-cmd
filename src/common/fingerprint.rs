@@ -14,7 +14,7 @@ pub struct MachineInfo {
 impl MachineInfo {
     /// 采集本机信息：hostname（COMPUTERNAME）、本机 IP、OS、MachineGuid（Windows）
     pub fn collect() -> Self {
-        let hostname = std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown".into());
+        let hostname = local_hostname();
         let user = std::env::var("USERNAME").unwrap_or_else(|_| "unknown".into());
         let ip = local_ip().unwrap_or_else(|| "0.0.0.0".into());
         MachineInfo {
@@ -44,6 +44,25 @@ pub fn hex_sha256(data: &[u8]) -> String {
     hasher.update(data);
     let out = hasher.finalize();
     out.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 本机主机名：Windows 取 COMPUTERNAME；Unix 依次尝试 /proc/sys/kernel/hostname、
+/// /etc/hostname、$HOSTNAME。服务器在注册响应中以此回传自己的显示名（server_hostname）。
+pub fn local_hostname() -> String {
+    #[cfg(windows)]
+    {
+        std::env::var("COMPUTERNAME").unwrap_or_else(|_| "unknown".into())
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::read_to_string("/proc/sys/kernel/hostname")
+            .or_else(|_| std::fs::read_to_string("/etc/hostname"))
+            .map(|s| s.trim().to_string())
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("HOSTNAME").ok())
+            .unwrap_or_else(|| "unknown".into())
+    }
 }
 
 /// Windows 注册表读取 MachineGuid；非 Windows 退化为 hostname

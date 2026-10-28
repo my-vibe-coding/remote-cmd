@@ -91,6 +91,9 @@ async fn register_to_server(
     let client_id = resp["client_id"].as_str().unwrap_or_default().to_string();
     let token = resp["token"].as_str().map(|s| s.to_string());
     let registered = token.is_some();
+    // 服务器自身主机名（注册响应 server_hostname）：作为该服务器在 UI 中的显示名。
+    // 旧版服务器无此字段时回退为空串，前端按 server_url 展示。
+    let server_hostname = resp["server_hostname"].as_str().unwrap_or_default().to_string();
 
     // 采集服务端证书指纹（TOFU 信任锚）：后续 WS 连接强校验，防中间人窃取凭证。
     // 采集失败不阻断注册（旧配置兼容：指纹为 None 时连接放行）。
@@ -106,6 +109,9 @@ async fn register_to_server(
         existing.client_id = client_id;
         existing.token = token;
         existing.registered = registered;
+        if !server_hostname.is_empty() {
+            existing.hostname = server_hostname;
+        }
         if cert_sha256.is_some() {
             existing.cert_sha256 = cert_sha256;
         }
@@ -113,7 +119,7 @@ async fn register_to_server(
         config.servers.push(ServerReg {
             server_url: server_url.clone(),
             client_id,
-            hostname: info.hostname.clone(),
+            hostname: server_hostname,
             token: token.clone(),
             registered,
             cert_sha256,

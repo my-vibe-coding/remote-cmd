@@ -15,6 +15,8 @@ pub struct AppState {
     pub data_dir: PathBuf,
     pub store: Store,
     pub audit: Arc<Audit>,
+    /// 服务器自身主机名：注册响应 server_hostname 字段回传，客户端用作服务器显示名
+    pub server_hostname: String,
     /// 管理员密码哈希（argon2）
     pub admin_password_hash: String,
     /// 会话 token -> 过期时间
@@ -35,6 +37,7 @@ impl AppState {
             data_dir,
             store,
             audit: Arc::new(audit),
+            server_hostname: crate::common::fingerprint::local_hostname(),
             admin_password_hash,
             sessions: Mutex::new(HashMap::new()),
             rate: RateLimiter::new(),

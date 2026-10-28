@@ -12,6 +12,8 @@ pub struct ServerReg {
     pub server_url: String,
     #[serde(default)]
     pub client_id: String,
+    /// 服务器自身主机名（注册响应 server_hostname），用作 UI 显示名；
+    /// 旧配置/旧服务器下可能为本机名或空串
     #[serde(default)]
     pub hostname: String,
     #[serde(default)]
