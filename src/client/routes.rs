@@ -401,15 +401,12 @@ async fn exec(Json(body): Json<ExecBody>) -> Result<Response, (StatusCode, Strin
     let program = payload["program"].as_str().unwrap_or_default().to_string();
     let args: Vec<String> = serde_json::from_value(payload["args"].clone())
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let mut ws = crate::client::remote::ws_exec(
-        &server.server_url,
-        &token,
+    let mut ws = crate::client::run_cmd::ws_exec_recovered(
+        &server,
         &program,
         &args,
-        None,
         false,
         None,
-        server.cert_sha256.as_deref(),
     )
     .await
     .map_err(|e| (StatusCode::BAD_GATEWAY, format!("执行请求失败: {e}")))?;
@@ -503,17 +500,8 @@ async fn exec_pty_bridge(
 
     let token = server.token.clone().unwrap_or_default();
     let ExecWs { sink: mut rtx, stream: mut rrx } =
-        match crate::client::remote::ws_exec(
-            &server.server_url,
-            &token,
-            &program,
-            &args,
-            None, // PTY 会话：无超时（与 CLI 交互会话一致）
-            true,
-            tty_size,
-            server.cert_sha256.as_deref(),
-        )
-        .await
+        match crate::client::run_cmd::ws_exec_recovered(&server, &program, &args, true, tty_size)
+            .await
         {
             Ok(v) => v,
             Err(e) => {

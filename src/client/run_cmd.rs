@@ -7,7 +7,10 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use super::config::{load_aliases, render_template, ClientConfig, ServerReg};
-use super::remote::{parse_frame, resize_msg, trace_frame, ws_exec, ExecFrame, ExecWs, STDIN_CLOSE};
+use super::remote::{
+    parse_frame, register, resize_msg, trace_frame, ws_exec, ExecFrame, ExecWs, STDIN_CLOSE,
+};
+use crate::common::fingerprint::MachineInfo;
 
 /// WS 心跳间隔：空闲会话周期发 Ping，防 NAT/代理静默掐断长连接
 const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -24,17 +27,8 @@ pub async fn run(alias: &str, args: &[String], verbose: bool) -> Result<()> {
     let pty = std::io::stdin().is_terminal();
     // PTY 会话：本地尺寸随 init 帧上报（服务端按此创建 PTY，避免 80x24 初始竞态）
     let tty_size = if pty { crossterm::terminal::size().ok() } else { None };
-    let ExecWs { sink, stream } = match ws_exec(
-        &server.server_url,
-        server.token.as_deref().unwrap_or_default(),
-        &program,
-        &cmd_args,
-        None,
-        pty,
-        tty_size,
-        server.cert_sha256.as_deref(),
-    )
-    .await
+    let ExecWs { sink, stream } = match ws_exec_recovered(&server, &program, &cmd_args, pty, tty_size)
+        .await
     {
         Ok(w) => w,
         Err(e) => anyhow::bail!("请求服务器失败: {e}"),
@@ -663,8 +657,78 @@ fn csi_mod_seq(final_byte: &[u8], modifier: u8) -> Vec<u8> {
     }
 }
 
-/// 解析别名的执行目标：别名绑定的服务器优先，否则使用默认（第一个已注册）服务器。
-/// 返回 (目标服务器, exec 请求体)
+/// 建立执行 WS 会话，凭证失效时自动恢复：
+/// 401（凭证被拒）时凭指纹重新注册一次并重试。覆盖"管理员恢复凭证（token 轮换）
+/// 后客户端旧 token 失效"的场景——记录仍为 Approved 时指纹注册直接领取新 token；
+/// 记录已被吊销/拒绝时注册只会重置为 Pending（不发 token），重试仍失败并返回原
+/// 错误，审批不会被绕过。
+pub async fn ws_exec_recovered(
+    server: &ServerReg,
+    program: &str,
+    args: &[String],
+    tty: bool,
+    tty_size: Option<(u16, u16)>,
+) -> Result<ExecWs> {
+    async fn connect(
+        server: &ServerReg,
+        token: &str,
+        program: &str,
+        args: &[String],
+        tty: bool,
+        tty_size: Option<(u16, u16)>,
+    ) -> Result<ExecWs> {
+        ws_exec(
+            &server.server_url,
+            token,
+            program,
+            args,
+            None,
+            tty,
+            tty_size,
+            server.cert_sha256.as_deref(),
+        )
+        .await
+    }
+    match connect(server, server.token.as_deref().unwrap_or_default(), program, args, tty, tty_size).await
+    {
+        Ok(v) => Ok(v),
+        Err(e) if is_auth_failure(&e) => {
+            crate::dlog!("[ws] 凭证被拒（401），尝试凭指纹自动重新注册");
+            let Some(new_token) = recover_token(&server.server_url).await else {
+                return Err(e); // 未领到新 token（如被重置为 Pending），维持原错误
+            };
+            crate::dlog!("[ws] 重新注册成功，已领取轮换后的 token，重试连接");
+            connect(server, &new_token, program, args, tty, tty_size).await
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// 判定连接失败是否为凭证失效（服务端 401 / WS 握手 rejected 中的凭证原因）
+fn is_auth_failure(e: &anyhow::Error) -> bool {
+    let msg = e.to_string();
+    msg.contains("401") || msg.contains("凭证")
+}
+
+/// 凭指纹重新注册：服务端记录仍为 Approved 时领取轮换后的新 token，
+/// 写回本地配置并返回；其余情况（Pending/被拒/网络失败）返回 None。
+async fn recover_token(server_url: &str) -> Option<String> {
+    let info = MachineInfo::collect();
+    let resp = register(server_url, &info).await.ok()?;
+    let token = resp["token"].as_str()?.to_string();
+    let mut config = ClientConfig::load().ok()?;
+    let existing = config.servers.iter_mut().find(|s| s.server_url == server_url)?;
+    existing.token = Some(token.clone());
+    existing.registered = true;
+    if let Some(h) = resp["server_hostname"].as_str()
+        && !h.is_empty()
+    {
+        existing.hostname = h.to_string();
+    }
+    config.save().ok()?;
+    Some(token)
+}
+
 pub fn resolve_exec_target(alias: &str, args: &[String]) -> Result<(ServerReg, serde_json::Value)> {
     let aliases = load_aliases()?;
     let Some(def) = aliases.get(alias) else {

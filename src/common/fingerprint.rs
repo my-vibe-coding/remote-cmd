@@ -65,7 +65,10 @@ pub fn local_hostname() -> String {
     }
 }
 
-/// Windows 注册表读取 MachineGuid；非 Windows 退化为 hostname
+/// 机器唯一标识：Windows 读注册表 MachineGuid；Linux 依次尝试 /etc/machine-id、
+/// /var/lib/dbus/machine-id（与 Windows MachineGuid 对等，重装系统才会变化），
+/// 再退化为 $HOSTNAME。该值是指纹四分量之一，直接影响幂等注册与凭证领取。
+/// 注意：改变取值来源会使既有 Linux 客户端的指纹变化，重新注册时被视为新机器。
 fn machine_guid() -> String {
     #[cfg(windows)]
     {
@@ -86,7 +89,13 @@ fn machine_guid() -> String {
     }
     #[cfg(not(windows))]
     {
-        std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown-guid".into())
+        std::fs::read_to_string("/etc/machine-id")
+            .or_else(|_| std::fs::read_to_string("/var/lib/dbus/machine-id"))
+            .map(|s| s.trim().to_string())
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("HOSTNAME").ok())
+            .unwrap_or_else(|| "unknown-guid".into())
     }
 }
 
