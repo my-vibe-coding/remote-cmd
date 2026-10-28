@@ -19,6 +19,15 @@ const server = ref('') // '' = 默认服务器
 const editing = ref<string | null>(null) // 正在编辑的原名称
 const formError = ref('')
 const saving = ref(false)
+/** 模板是否被手动编辑过：新建模式下未编辑时模板跟随别名名自动生成，减少输入量 */
+const templateTouched = ref(false)
+const nameInput = ref<HTMLInputElement | null>(null)
+
+/** 别名输入：仅新建模式且模板未手动编辑时，自动生成 <别名> {args} 形态 */
+function onNameInput() {
+  if (templateTouched.value || editing.value) return
+  template.value = name.value ? `${name.value} {args}` : ''
+}
 
 // 后端约束：名称仅允许字母数字下划线连字符
 const NAME_RE = /^[A-Za-z0-9_-]+$/
@@ -60,14 +69,17 @@ function resetForm() {
   template.value = ''
   server.value = ''
   editing.value = null
+  templateTouched.value = false
   formError.value = ''
 }
 
 function edit(item: AliasItem) {
   editing.value = item.name
   name.value = item.name
+  // 编辑模式不自动改写模板（包括不自动追加 {args}），原样保留
   template.value = item.template
   server.value = item.server
+  templateTouched.value = true
   formError.value = ''
 }
 
@@ -98,6 +110,8 @@ async function save() {
     formError.value = e instanceof ApiError ? `保存失败 (HTTP ${e.status})：${e.message}` : '保存失败：网络错误'
   } finally {
     saving.value = false
+    // 保存后聚焦别名框，便于连续录入
+    nameInput.value?.focus()
   }
 }
 
@@ -105,7 +119,7 @@ async function remove(item: AliasItem) {
   const { confirmed, value } = await confirm({
     title: '删除确认',
     content: `确定删除别名「${item.name}」吗？`,
-    // options: [{ label: '同时删除对应脚本', value: 'script', checked: true }],
+    options: [{ label: '同时删除对应脚本', value: 'script', checked: true }],
     multiple: true, // 单选项需要可取消勾选，用 checkbox 而非 radio
     danger: true,
   })
@@ -170,11 +184,13 @@ onMounted(() => {
       </p>
       <div class="form-row">
         <input
+          ref="nameInput"
           v-model="name"
           class="input"
           style="width: 180px"
           type="text"
           placeholder="别名，如 deploy"
+          @input="onNameInput"
           @keyup.enter="save"
         />
         <input
@@ -182,6 +198,7 @@ onMounted(() => {
           class="input grow"
           type="text"
           placeholder="命令模板，如 git add {args}"
+          @input="templateTouched = true"
           @keyup.enter="save"
         />
         <select v-model="server" class="select" style="width: 220px" title="执行服务器">

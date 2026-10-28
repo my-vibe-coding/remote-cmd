@@ -103,3 +103,40 @@ export function confirm(params: ConfirmParams = {}): Promise<ConfirmResult> {
     app.mount(container)
   })
 }
+
+// ============================================================
+// 浏览器功能
+// ============================================================
+
+/** 复制文本到剪贴板 */
+export async function copyToClipboard(text: string): Promise<boolean> {
+  // 优先用现代 API
+  if (navigator.clipboard && window.isSecureContext) {
+    try {
+      await navigator.clipboard.writeText(text)
+      return true
+    } catch {
+      // 失败则走下面的降级方案
+    }
+  }
+  // 降级：老式 execCommand
+  const input = document.createElement('input')
+  input.value = text
+  input.style.position = 'fixed'
+  input.style.opacity = '0'
+  document.body.appendChild(input)
+  input.select()
+  let ok = false
+  try {
+    ok = document.execCommand('copy')
+  } catch {
+    ok = false
+  } finally {
+    document.body.removeChild(input)  // 务必清理
+  }
+  return ok
+}
+
+export function openWindow(url: string) {
+  window.open(url, '_blank')
+}

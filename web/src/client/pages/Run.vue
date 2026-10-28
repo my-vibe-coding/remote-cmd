@@ -94,7 +94,7 @@ async function run() {
     sysLine: `▶ ${serverLabel ? `[${serverLabel}] ` : ''}${alias.value}${args.length ? ' ' + args.join(' ') : ''}`,
   }
   runs.push(item)
-  argsText.value = ''
+  // 参数保留不清空：便于连续执行同一命令（微调参数或重复执行）
   // PTY 模式的 WS 连接在面板 ready 事件后建立（需要终端自适应出的列行数）
   if (!item.pty) startSse(item)
 }

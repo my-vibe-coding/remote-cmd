@@ -121,6 +121,7 @@ onBeforeUnmount(() => document.removeEventListener('keydown', onKeydown))
   margin: 0 0 8px;
   font-size: 16px;
   font-weight: 600;
+  user-select: none;
 }
 
 .confirm-content {

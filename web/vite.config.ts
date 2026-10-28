@@ -1,6 +1,7 @@
 import { defineConfig, Plugin } from 'vite'
 import vue from '@vitejs/plugin-vue'
 import { fileURLToPath, URL } from 'node:url'
+import vueDevTools from 'vite-plugin-vue-devtools'
 
 /** 以当前配置文件为基准解析相对路径（ESM 下没有 __dirname） */
 const r = (p: string) => fileURLToPath(new URL(p, import.meta.url))
@@ -34,7 +35,7 @@ const toRemoteServer = {
 }
 
 export default defineConfig({
-  plugins: [vue(), adminHtmlFallback()],
+  plugins: [vue(), adminHtmlFallback(), vueDevTools({ launchEditor: 'trae' })],
   build: {
     rollupOptions: {
       input: {

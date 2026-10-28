@@ -9,7 +9,7 @@ import {
   type ServerRegInfo,
 } from '../../shared/api'
 import StatusBadge from '../../shared/StatusBadge.vue'
-import { confirm } from '../../shared/utils'
+import { confirm, copyToClipboard, openWindow } from '../../shared/utils'
 
 // ---------- 本机信息 ----------
 const info = ref<HostInfo | null>()
@@ -176,7 +176,7 @@ onMounted(async () => {
         <div v-for="s in servers" :key="s.server_url" class="server-row">
           <div class="server-head">
             <StatusBadge :status="displayStatus(s)" />
-            <span class="mono server-url">{{ s.server_url }}</span>
+            <span class="mono server-url">{{ s.hostname }}</span>
             <button
               v-if="!s.registered && s.status !== 'pending' && s.status !== 'unreachable'"
               class="btn btn-sm"
@@ -195,6 +195,12 @@ onMounted(async () => {
           </div>
           <div class="server-detail">
             <span class="dim">客户端 ID</span><span class="mono">{{ shortId(s.client_id) }}</span>
+            <span class="dim">注册地址</span>
+            <span class="mono">
+              <span>{{ s.server_url }}</span>
+              <button class="btn btn-sm" @click="copyToClipboard(s.server_url)">复制</button>
+              <button class="btn btn-sm btn-primary" @click="openWindow(s.server_url + '/admin')">管理</button>
+            </span>
             <span class="dim">状态</span>
             <span :class="{ 'warn-text': s.status === 'revoked' || s.status === 'deleted' || s.status === 'unreachable' }">
               {{ s.registered ? '已批准可用' : statusText(s) || '待审批' }}
@@ -286,6 +292,17 @@ onMounted(async () => {
   margin-top: 8px;
   padding-left: 4px;
   font-size: 13px;
+
+  .dim {
+    display: flex;
+    align-items: safe center;
+  }
+
+  .mono {
+    display: flex;
+    align-items: safe center;
+    gap: 4px;
+  }
 }
 
 .warn-text {
