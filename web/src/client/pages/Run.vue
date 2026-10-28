@@ -18,6 +18,8 @@ interface RunSession {
   pty: boolean
   /** 首行系统提示（▶ 命令回显，仅只读模式显示） */
   sysLine: string
+  /** 会话是否已落终态（exit / 异常断开）；未落终态时启用关闭页面前确认 */
+  done: boolean
 }
 
 const aliases = ref<Record<string, AliasDefInfo>>({})
@@ -92,11 +94,18 @@ async function run() {
     args,
     pty: ptyMode.value,
     sysLine: `▶ ${serverLabel ? `[${serverLabel}] ` : ''}${alias.value}${args.length ? ' ' + args.join(' ') : ''}`,
+    done: false,
   }
   runs.push(item)
   // 参数保留不清空：便于连续执行同一命令（微调参数或重复执行）
   // PTY 模式的 WS 连接在面板 ready 事件后建立（需要终端自适应出的列行数）
   if (!item.pty) startSse(item)
+}
+
+/** 终态包装：父级调用 finish 的所有路径同步标记会话已结束（供关闭拦截判断） */
+function finishSession(item: RunSession, payload: Parameters<PanelApi['finish']>[0]) {
+  item.done = true
+  panels.get(item.id)?.finish(payload)
 }
 
 // ---------- SSE 只读会话（管道模式，无 stdin 交互） ----------
@@ -117,15 +126,15 @@ async function startSse(item: RunSession) {
           panel()?.feed(payload.stream, decodeBase64Utf8(payload.data_b64))
         }
       } else if (ev.event === 'exit') {
-        panel()?.finish(JSON.parse(ev.data))
+        finishSession(item, JSON.parse(ev.data))
       }
     })
     // 流提前结束但没收到 exit 事件
-    panel()?.finish(null)
+    finishSession(item, null)
   } catch (e) {
     const msg = e instanceof ApiError ? `请求失败 (HTTP ${e.status})：${e.message}` : String(e)
     panel()?.feed('stderr', msg)
-    panel()?.finish(null)
+    finishSession(item, null)
   } finally {
     controllers.delete(item.id)
   }
@@ -152,10 +161,10 @@ function openPtySession(item: RunSession, size: { cols: number; rows: number }) 
     if (typeof e.data === 'string') {
       try {
         const v = JSON.parse(e.data)
-        if (v.type === 'exit') panel.finish(v)
+        if (v.type === 'exit') finishSession(item, v)
         else if (v.type === 'error') {
           panel.termWrite(`\r\n\x1b[31m${v.message ?? '连接失败'}\x1b[0m\r\n`)
-          panel.finish(null)
+          finishSession(item, null)
         }
       } catch {
         /* 忽略非 JSON 文本帧 */
@@ -165,7 +174,7 @@ function openPtySession(item: RunSession, size: { cols: number; rows: number }) 
     }
   }
   // finish 幂等：已收到 exit 则此处无操作；异常断开则标记终态
-  ws.onclose = () => panel.finish(null)
+  ws.onclose = () => finishSession(item, null)
   ws.onerror = () => panel.termWrite('\r\n\x1b[31m[连接中断]\x1b[0m\r\n')
 }
 
@@ -194,6 +203,17 @@ function closeRun(id: number) {
 }
 
 onMounted(load)
+
+// 防误关：Ctrl+W 等关闭页面的组合键属于浏览器保留键，页面无法拦截（也无法转发给
+// 远端终端），只能在有未结束会话时通过 beforeunload 触发浏览器原生确认框兜底。
+function beforeUnload(e: BeforeUnloadEvent) {
+  if (runs.some((r) => !r.done)) {
+    e.preventDefault()
+    e.returnValue = '' // Chrome 需要显式 returnValue
+  }
+}
+onMounted(() => window.addEventListener('beforeunload', beforeUnload))
+onBeforeUnmount(() => window.removeEventListener('beforeunload', beforeUnload))
 
 onBeforeUnmount(() => {
   // 离开页面时终止所有仍在执行的会话
