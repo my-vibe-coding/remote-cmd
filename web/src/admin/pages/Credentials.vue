@@ -2,7 +2,7 @@
 import { onMounted, reactive, ref } from 'vue'
 import { adminApi, ApiError, type Registration } from '../../shared/api'
 import StatusBadge from '../../shared/StatusBadge.vue'
-import { formatTs } from '../../shared/utils'
+import { formatTs, confirm } from '../../shared/utils'
 
 const rows = ref<Registration[]>([])
 const loading = ref(false)
@@ -78,12 +78,12 @@ async function saveWhitelist(row: Registration) {
 }
 
 async function revoke(row: Registration) {
-  if (
-    !window.confirm(
-      `确认吊销「${row.hostname}（${row.ip}）」的凭证？吊销后该客户端将无法继续执行任何命令。`,
-    )
-  )
-    return
+  const { confirmed } = await confirm({
+    title: '吊销确认',
+    content: `确定吊销「${row.hostname}（${row.ip}）」的凭证吗？吊销后该客户端将无法继续执行任何命令。`,
+    danger: true,
+  })
+  if (!confirmed) return
   busyId.value = keyOf(row)
   error.value = ''
   try {
@@ -98,7 +98,11 @@ async function revoke(row: Registration) {
 
 /** 恢复已吊销的凭证：重新签发 token（等同重新批准） */
 async function restore(row: Registration) {
-  if (!window.confirm(`确认恢复「${row.hostname}（${row.ip}）」的凭证？将重新签发 token。`)) return
+  const { confirmed } = await confirm({
+    title: '恢复确认',
+    content: `确定恢复「${row.hostname}（${row.ip}）」的凭证吗？将重新签发 token。`,
+  })
+  if (!confirmed) return
   busyId.value = keyOf(row)
   error.value = ''
   try {

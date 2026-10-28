@@ -9,6 +9,7 @@ import {
   type ServerRegInfo,
 } from '../../shared/api'
 import StatusBadge from '../../shared/StatusBadge.vue'
+import { confirm } from '../../shared/utils'
 
 // ---------- 本机信息 ----------
 const info = ref<HostInfo | null>()
@@ -110,7 +111,12 @@ async function reRegister(s: ServerRegInfo) {
 // ---------- 注销 ----------
 async function unregister(s: ServerRegInfo) {
   const name = s.hostname || s.server_url
-  if (!window.confirm(`确认注销在服务器「${name}」的注册？本机凭证将被删除。`)) return
+  const { confirmed } = await confirm({
+    title: '注销确认',
+    content: `确定注销在服务器「${name}」的注册吗？本机凭证将被删除。`,
+    danger: true,
+  })
+  if (!confirmed) return
   unregistering.value = s.server_url
   errorMsg.value = ''
   notice.value = ''

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue'
 import { ApiError, localApi, type AliasDefInfo, type ServerRegInfo } from '../../shared/api'
+import { confirm } from '../../shared/utils'
 
 interface AliasItem {
   name: string
@@ -101,7 +102,18 @@ async function save() {
 }
 
 async function remove(item: AliasItem) {
-  if (!window.confirm(`确认删除别名「${item.name}」？`)) return
+  const { confirmed, value } = await confirm({
+    title: '删除确认',
+    content: `确定删除别名「${item.name}」吗？`,
+    // options: [{ label: '同时删除对应脚本', value: 'script', checked: true }],
+    multiple: true, // 单选项需要可取消勾选，用 checkbox 而非 radio
+    danger: true,
+  })
+  if (!confirmed) return
+  if (value?.includes('script')) {
+    // 脚本可能不存在，删除失败不阻塞别名删除
+    await localApi.deleteScript(item.name).catch(() => {})
+  }
   try {
     await localApi.deleteAlias(item.name)
     await load()

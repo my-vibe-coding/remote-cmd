@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref } from 'vue'
 import { ApiError, localApi } from '../../shared/api'
+import { confirm } from '../../shared/utils'
 
 interface AliasItem {
   name: string
@@ -57,7 +58,12 @@ async function reveal(name: string) {
 }
 
 async function removeScript(item: AliasItem) {
-  if (!window.confirm(`确认删除别名「${item.name}」的脚本？`)) return
+  const { confirmed } = await confirm({
+    title: '删除确认',
+    content: `确定删除别名「${item.name}」的脚本吗？`,
+    danger: true,
+  })
+  if (!confirmed) return
   error.value = ''
   try {
     await localApi.deleteScript(item.name)

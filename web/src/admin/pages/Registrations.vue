@@ -2,7 +2,7 @@
 import { onMounted, ref } from 'vue'
 import { adminApi, ApiError, type Registration } from '../../shared/api'
 import StatusBadge from '../../shared/StatusBadge.vue'
-import { formatTs } from '../../shared/utils'
+import { formatTs, confirm } from '../../shared/utils'
 
 const rows = ref<Registration[]>([])
 const loading = ref(false)
@@ -39,7 +39,12 @@ async function approve(row: Registration) {
 }
 
 async function reject(row: Registration) {
-  if (!window.confirm(`确认拒绝「${row.hostname}（${row.ip}）」的注册申请？`)) return
+  const { confirmed } = await confirm({
+    title: '拒绝申请',
+    content: `确定拒绝「${row.hostname}（${row.ip}）」的注册申请吗？`,
+    danger: true,
+  })
+  if (!confirmed) return
   busyId.value = String(row.id)
   error.value = ''
   try {
@@ -53,7 +58,12 @@ async function reject(row: Registration) {
 }
 
 async function remove(row: Registration) {
-  if (!window.confirm(`确认删除「${row.hostname}」的申请记录？删除后客户端可重新申请。`)) return
+  const { confirmed } = await confirm({
+    title: '删除确认',
+    content: `确定删除「${row.hostname}」的申请记录吗？删除后客户端可重新申请。`,
+    danger: true,
+  })
+  if (!confirmed) return
   busyId.value = String(row.id)
   error.value = ''
   try {
