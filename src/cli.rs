@@ -35,4 +35,10 @@ pub enum Command {
         /// 命令别名（省略则为所有别名生成）
         alias: Option<String>,
     },
+    /// 自更新：从 GitHub Releases 拉取最新版本并替换自身
+    Update {
+        /// 仅检查是否有新版本，不执行更新
+        #[arg(long)]
+        check: bool,
+    },
 }

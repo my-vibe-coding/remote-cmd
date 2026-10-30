@@ -3,6 +3,7 @@ pub mod fingerprint;
 pub mod json_file;
 pub mod net;
 pub mod paths;
+pub mod self_update;
 
 use std::io;
 use thiserror::Error;
