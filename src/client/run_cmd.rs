@@ -436,17 +436,34 @@ fn collect_burst(first: Vec<u8>) -> Option<Vec<u8>> {
 }
 
 /// 判定突发输入是否为"全部存在的本地文件路径"（拖放/粘贴上传触发条件）：
-/// 解析为至少一个 token 且**全部**存在、均为普通文件 → 返回待上传文件列表；
-/// 否则返回 None，原始字节按普通输入透传给远端。
+/// 优先按引号语义解析（资源管理器拖放/规范粘贴，空格分隔、含空格路径 "" 包裹），
+/// 全部 token 均为存在的普通文件 → 触发上传；
+/// 否则若整串不含引号，视为**单个**无引号路径（含空格），整串查文件存在性；
+/// 都不满足 → 返回 None，原始字节按普通输入透传给远端。
 fn upload_paths(burst: &[u8]) -> Option<Vec<std::path::PathBuf>> {
     let text = std::str::from_utf8(burst).ok()?;
-    let text = text.trim_end_matches(['\r', '\n', ' ']);
-    let paths = parse_paths(text);
-    if paths.is_empty() {
+    let text = text.trim_matches(['\r', '\n', ' ']);
+    if text.is_empty() {
         return None;
     }
-    let files: Vec<std::path::PathBuf> = paths.into_iter().map(std::path::PathBuf::from).collect();
-    files.iter().all(|p| p.is_file()).then_some(files)
+
+    // 引号语义：空格分隔，含空格路径以 "" 包裹
+    let paths = parse_paths(text);
+    if !paths.is_empty() {
+        let files: Vec<std::path::PathBuf> = paths.into_iter().map(std::path::PathBuf::from).collect();
+        if files.iter().all(|p| p.is_file()) {
+            return Some(files);
+        }
+    }
+
+    // 无引号含空格：只可能是单个路径，整串当文件名查（存在即为单路径，否则透传）
+    if !text.contains('"') {
+        let p = std::path::PathBuf::from(text);
+        if p.is_file() {
+            return Some(vec![p]);
+        }
+    }
+    None
 }
 
 /// 解析拖放/粘贴的路径串：空格分隔；含空格的路径用双引号包裹（资源管理器拖放行为）。
@@ -989,6 +1006,34 @@ mod tests {
         );
         // 非法 UTF-8 → 不触发
         assert!(upload_paths(&[0xff, 0xfe]).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// upload_paths 端到端：无引号空格路径整串当单文件查
+    #[test]
+    fn upload_paths_supports_unquoted_spaced_paths() {
+        let dir = std::env::temp_dir().join(format!("rc-up-unquoted-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let spaced = dir.join("x y.txt");
+        std::fs::write(&spaced, "x").unwrap();
+
+        // 无引号单路径（含空格）→ 整串命中
+        assert_eq!(
+            upload_paths(spaced.to_string_lossy().as_bytes()).map(|v| v.len()),
+            Some(1)
+        );
+        // 命令 + 存在路径 → 整串不是文件，不触发（原文透传）
+        let cmd = format!("cat {}", spaced.display());
+        assert!(upload_paths(cmd.as_bytes()).is_none());
+        // 两个无引号路径 → 整串不是文件，不触发（含空格多路径只支持引号包裹形式）
+        let plain = dir.join("p1.txt");
+        std::fs::write(&plain, "x").unwrap();
+        let two = format!("{} {}", spaced.display(), plain.display());
+        assert!(upload_paths(two.as_bytes()).is_none());
+        // 引号包裹 → 引号语义直接命中
+        let quoted = format!("\"{}\"", spaced.display());
+        assert_eq!(upload_paths(quoted.as_bytes()).map(|v| v.len()), Some(1));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
