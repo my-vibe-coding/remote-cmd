@@ -15,7 +15,7 @@ A single-binary remote command execution tool: the server provides an HTTPS admi
 - **Aliases with templates**: an alias maps to a command template (e.g. `git add {args}`) with transparent argument passing, bindable to any registered server
 - **Executable script shims**: generate a script per alias into the bin directory so it can be invoked from any terminal; Ctrl+C terminates directly with no confirmation prompt
 - **Audit log**: every execution is recorded and traceable
-- **Public address display**: the server fetches its public IPv4 via ipv4.ip.sb on startup for convenient external access
+- **File upload**: support drag-and-drop file upload from the client, with a 2GB limit per file
 
 ## Quick Start
 

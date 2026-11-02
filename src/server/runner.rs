@@ -634,7 +634,11 @@ async fn run_pty(
                             }
                             ScanState::Osc => match b {
                                 0x07 => {
-                                    maybe_osc_query_fallback(&seq[2..seq.len() - 1], &cpr_tx);
+                                    // 空 OSC（ESC]BEL）时 seq 仅剩 2 字节前缀，无 body 可判定，
+                                    // 直接跳过（len < 3 时切片 [2..len-1] 会 panic）
+                                    if seq.len() >= 3 {
+                                        maybe_osc_query_fallback(&seq[2..seq.len() - 1], &cpr_tx);
+                                    }
                                     seq.clear();
                                     scan = ScanState::Normal;
                                 }
