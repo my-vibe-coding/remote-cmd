@@ -8,12 +8,16 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use super::config::{load_aliases, render_template, ClientConfig, ServerReg};
 use super::remote::{
-    parse_frame, register, resize_msg, trace_frame, ws_exec, ExecFrame, ExecWs, STDIN_CLOSE,
+    parse_frame, register, resize_msg, trace_frame, ws_exec, ws_upload, ExecFrame, ExecWs,
+    STDIN_CLOSE,
 };
 use crate::common::fingerprint::MachineInfo;
 
 /// WS 心跳间隔：空闲会话周期发 Ping，防 NAT/代理静默掐断长连接
 const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// 失焦后突发输入的静默判定窗：拖放/粘贴的路径字节间隔 <1ms，静默 10ms 视为输入完毕
+const BURST_QUIET: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// `remote-cmd run <别名> [args...]`：读取本地配置 → 模板渲染 → WS 会话 → stdin 转发 + 流式输出 → 透传退出码。
 /// `verbose=false`（别名 shim 模式）时抑制 stderr 提示信息，避免污染包装脚本的输出处理。
@@ -35,7 +39,7 @@ pub async fn run(alias: &str, args: &[String], verbose: bool) -> Result<()> {
     };
 
     if pty {
-        return run_pty_session(sink, stream, verbose).await;
+        return run_pty_session(sink, stream, verbose, server).await;
     }
 
     // 管道 stdin → 转发原始字节，EOF 时发 stdin_close
@@ -151,42 +155,74 @@ fn spawn_stdin_pump(
 
 /// PTY 交互会话：本地终端 raw mode，按键即时转发、resize 同步、ANSI 原样渲染。
 /// Ctrl+] 脱离会话（断开连接，远端子进程被服务端终止）。
+/// 失焦后的首次输入（拖放/粘贴的文件路径）被缓冲判定：解析为全部存在的本地文件
+/// 时上传到服务端并把远端路径注入 shell，否则原文透传（见 InputAction::Upload）。
 async fn run_pty_session(
     mut sink: futures::stream::SplitSink<super::remote::WsStream, WsMessage>,
     mut stream: futures::stream::SplitStream<super::remote::WsStream>,
     verbose: bool,
+    server: ServerReg,
 ) -> Result<()> {
     use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 
     crossterm::terminal::enable_raw_mode().map_err(|e| anyhow!("进入 raw mode 失败: {e}"))?;
+    // 焦点上报：失焦事件武装"拖放/粘贴路径 → 上传"检测（Windows FOCUS_EVENT / Unix 1004 模式）
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableFocusChange);
     let _raw = RawModeGuard::new(); // Drop 兜底恢复（显式退出路径已在 exit 前手动关闭）
 
     enum InputAction {
         Data(Vec<u8>),
+        /// 失焦后突发输入被判定为本地文件（拖放/粘贴路径）：上传远端后注入远端路径；
+        /// raw 为原始字节，任一文件上传失败时回退原文透传
+        Upload { files: Vec<std::path::PathBuf>, raw: Vec<u8> },
         Resize(u16, u16),
         Detach,
     }
 
-    // 本地输入线程：阻塞读控制台事件 → 通道
+    // 本地输入线程：poll 循环读控制台事件 → 通道。
+    // 拖放文件到命令行窗口必先失焦，路径文本随后写入（字节间隔 <1ms）；焦点恢复与
+    // 输入到达的顺序不定（失焦→输入→获焦 / 失焦→获焦→输入），因此仅以失焦事件武装、
+    // 首次输入触发突发收集后立即解除武装，不依赖焦点恢复时序。
     let (itx, mut irx) = mpsc::channel::<InputAction>(64);
     let _input_thread = std::thread::spawn(move || {
+        let mut armed = false;
         loop {
+            // 非阻塞读取事件，避免阻塞主循环。
+            // 仅在有事件时才处理，避免空轮询；无事件时，继续等待下一次轮询；事件处理失败时，退出循环。
+            // 代价：空闲时每秒 5 次的 poll 空转，对性能影响较小。
+            match crossterm::event::poll(std::time::Duration::from_millis(200)) {
+                Ok(true) => {}
+                Ok(false) => continue,
+                Err(_) => break,
+            }
+            // 此函数会阻塞，直到有可用的事件为止
+            // 将其与poll函数结合使用，即可实现非阻塞读取
             match crossterm::event::read() {
+                Ok(Event::FocusLost) => armed = true,
                 Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => {
                     if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char(']') {
                         let _ = itx.blocking_send(InputAction::Detach);
                         break;
                     }
-                    if let Some(bytes) = key_to_bytes(k) {
-                        if itx.blocking_send(InputAction::Data(bytes)).is_err() {
+                    let Some(bytes) = key_to_bytes(k) else { continue };
+                    if armed {
+                        let Some(burst) = collect_burst(bytes) else { break };
+                        armed = false; // 仅失焦后的首次输入参与判定，无论结果如何解除武装
+                        let action = match upload_paths(&burst) {
+                            Some(files) => InputAction::Upload { files, raw: burst },
+                            None => InputAction::Data(burst),
+                        };
+                        if itx.blocking_send(action).is_err() {
                             break;
                         }
+                    } else if itx.blocking_send(InputAction::Data(bytes)).is_err() {
+                        break;
                     }
                 }
                 Ok(Event::Resize(cols, rows)) => {
                     let _ = itx.blocking_send(InputAction::Resize(cols, rows));
                 }
-                Ok(_) => {}
+                Ok(_) => {} // 焦点恢复等事件不解除武装
                 Err(_) => break,
             }
         }
@@ -196,6 +232,9 @@ async fn run_pty_session(
     // 空闲时周期发 Ping 心跳，防 NAT/代理静默掐断空闲 PTY 会话（axum 服务端自动回 Pong）。
     let (detach_tx, mut detach_rx) = mpsc::channel::<()>(1);
     let mut reply_filter = ReplyFilter::new();
+    let upload_url = server.server_url.clone();
+    let upload_token = server.token.clone().unwrap_or_default();
+    let upload_cert = server.cert_sha256.clone();
     let forward = tokio::spawn(async move {
         let mut ping = tokio::time::interval(PING_INTERVAL);
         loop {
@@ -223,6 +262,46 @@ async fn run_pty_session(
                             WsMessage::Binary(filtered.into())
                         }
                     },
+                    Some(InputAction::Upload { files, raw }) => {
+                        // 逐文件上传（独立 WS 连接）；全部成功 → 把远端路径注入远端 shell
+                        //（等价于用户在提示符处输入文件参数），任一失败 → 回退原文透传。
+                        let mut remote = Vec::with_capacity(files.len());
+                        let mut failed = false;
+                        for f in &files {
+                            let name = f
+                                .file_name()
+                                .map(|s| s.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            let size = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
+                            let res = match tokio::fs::File::open(f).await {
+                                Ok(mut file) => {
+                                    ws_upload(&upload_url, &upload_token, &name, size, &mut file, upload_cert.as_deref())
+                                        .await
+                                }
+                                Err(e) => Err(anyhow!("本地文件打开失败: {e}")),
+                            };
+                            match res {
+                                Ok(p) => remote.push(p),
+                                Err(e) => {
+                                    crate::dlog!("[upload] {name} 上传失败: {e:#}");
+                                    failed = true;
+                                    break;
+                                }
+                            }
+                        }
+                        let text = if failed || remote.is_empty() {
+                            String::from_utf8_lossy(&raw).into_owned()
+                        } else {
+                            crate::dlog!("[upload] 已上传 {} 个文件: {}", remote.len(), remote.join(" "));
+                            remote.iter().map(|p| quote_for_shell(p)).collect::<Vec<_>>().join(" ")
+                        };
+                        let filtered = reply_filter.feed(text.as_bytes());
+                        if sink.send(WsMessage::Binary(filtered.into())).await.is_err() {
+                            crate::dlog!("[pty-in] WS 发送失败（上传结果注入），输入转发终止");
+                            break;
+                        }
+                        continue;
+                    }
                     Some(InputAction::Resize(c, r)) => {
                         crate::dlog!("[pty-in] 客户端上报终端尺寸 {}x{}", c, r);
                         resize_msg(c, r)
@@ -307,6 +386,7 @@ async fn run_pty_session(
 
     forward.abort();
     let _ = crossterm::terminal::disable_raw_mode();
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableFocusChange);
     drop(_raw); // 避免 Drop 重复 disable（disable 幂等，仅语义清晰）
 
     if detached {
@@ -328,6 +408,106 @@ async fn run_pty_session(
             std::process::exit(1);
         }
     }
+}
+
+/// 收集失焦后的首次输入突发：新输入不断续期，静默 BURST_QUIET（10ms）视为输入完毕。
+/// 拖放/粘贴的路径字节流间隔 <1ms 会合成一个突发，而正常打键间隔远大于 10ms，
+/// 每个按键单独成突发、逐个透传，不产生可感知延迟。
+/// 返回 None 表示输入源出错（放弃收集，且不应继续读输入线程循环）。
+fn collect_burst(first: Vec<u8>) -> Option<Vec<u8>> {
+    use crossterm::event::{Event, KeyEventKind};
+    let mut burst = first;
+    loop {
+        match crossterm::event::poll(BURST_QUIET) {
+            Ok(true) => {}
+            Ok(false) => return Some(burst), // 静默超时：输入完毕
+            Err(_) => return None,
+        }
+        match crossterm::event::read() {
+            Ok(Event::Key(k)) if k.kind == KeyEventKind::Press => {
+                if let Some(b) = key_to_bytes(k) {
+                    burst.extend_from_slice(&b);
+                }
+            }
+            Ok(_) => {} // 焦点/Resize 等事件不打断收集
+            Err(_) => return None,
+        }
+    }
+}
+
+/// 判定突发输入是否为"全部存在的本地文件路径"（拖放/粘贴上传触发条件）：
+/// 解析为至少一个 token 且**全部**存在、均为普通文件 → 返回待上传文件列表；
+/// 否则返回 None，原始字节按普通输入透传给远端。
+fn upload_paths(burst: &[u8]) -> Option<Vec<std::path::PathBuf>> {
+    let text = std::str::from_utf8(burst).ok()?;
+    let text = text.trim_end_matches(['\r', '\n', ' ']);
+    let paths = parse_paths(text);
+    if paths.is_empty() {
+        return None;
+    }
+    let files: Vec<std::path::PathBuf> = paths.into_iter().map(std::path::PathBuf::from).collect();
+    files.iter().all(|p| p.is_file()).then_some(files)
+}
+
+/// 解析拖放/粘贴的路径串：空格分隔；含空格的路径用双引号包裹（资源管理器拖放行为）。
+/// 采用 Win32 CommandLineToArgvW 语义：引号切换引内模式，引内 `""` 为字面引号，
+/// 反斜杠仅在紧邻引号前成对转义（奇数个时该引号字面化）——同时兼容含双引号的
+/// Unix 路径（如 `"/tmp/a""b.txt"` → `/tmp/a"b.txt"`）。
+fn parse_paths(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    let mut has_token = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            ' ' | '\t' if !in_quotes => {
+                if has_token {
+                    out.push(std::mem::take(&mut cur));
+                    has_token = false;
+                }
+            }
+            '"' => {
+                // 收集紧邻的反斜杠：奇数个时引号被转义为字面，偶数个（含 0）时切换模式
+                let mut bs = 0usize;
+                while cur.ends_with('\\') {
+                    bs += 1;
+                    cur.pop();
+                }
+                if bs % 2 == 1 {
+                    for _ in 0..bs / 2 {
+                        cur.push('\\');
+                    }
+                    cur.push('"');
+                } else {
+                    for _ in 0..bs / 2 {
+                        cur.push('\\');
+                    }
+                    if in_quotes && chars.peek() == Some(&'"') {
+                        chars.next(); // 引内 "" → 字面引号
+                        cur.push('"');
+                    } else {
+                        in_quotes = !in_quotes;
+                    }
+                }
+                has_token = true;
+            }
+            _ => {
+                cur.push(c);
+                has_token = true;
+            }
+        }
+    }
+    if has_token {
+        out.push(cur);
+    }
+    out
+}
+
+/// 远端路径 → shell 参数文本：统一 POSIX 单引号字面量语义（`$`、反引号、`"` 均不展开，
+/// 防止不可信文件名在远端 shell 触发命令替换），内部单引号以 `'\''` 转义
+fn quote_for_shell(p: &str) -> String {
+    format!("'{}'", p.replace('\'', "'\\''"))
 }
 
 /// raw mode 兜底恢复：正常返回路径经 Drop 关闭；process::exit 路径需在此之前手动关闭。
@@ -757,6 +937,75 @@ pub fn resolve_exec_target(alias: &str, args: &[String]) -> Result<(ServerReg, s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 路径串解析：空格分隔、引号包裹含空格路径、引内 "" 字面引号、反斜杠转义
+    #[test]
+    fn parse_paths_variants() {
+        assert_eq!(parse_paths("C:\\a.txt"), vec!["C:\\a.txt"]);
+        assert_eq!(parse_paths("\"C:\\a b\\c.txt\""), vec!["C:\\a b\\c.txt"]);
+        assert_eq!(
+            parse_paths("\"C:\\a b.txt\" C:\\c.txt /tmp/x"),
+            vec!["C:\\a b.txt", "C:\\c.txt", "/tmp/x"]
+        );
+        // 引内 "" → 字面引号（含双引号的 Unix 路径）
+        assert_eq!(parse_paths("\"/tmp/a\"\"b.txt\""), vec!["/tmp/a\"b.txt"]);
+        // 引内反斜杠不影响（非紧邻引号）
+        assert_eq!(parse_paths("\"C:\\a\\b.txt\""), vec!["C:\\a\\b.txt"]);
+        // 多空白分隔
+        assert_eq!(parse_paths("  spaced   out\t "), vec!["spaced", "out"]);
+        // 引内空格保留
+        assert_eq!(parse_paths("\"  lead\""), vec!["  lead"]);
+    }
+
+    /// 上传判定：全部 token 存在且为普通文件才触发；目录/不存在的路径按普通输入透传
+    #[test]
+    fn upload_paths_requires_all_regular_files() {
+        let dir = std::env::temp_dir().join(format!("rc-upload-paths-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let a = dir.join("a.txt");
+        std::fs::write(&a, "x").unwrap();
+
+        // 单个存在的文件 → 触发
+        assert_eq!(
+            upload_paths(a.to_string_lossy().as_bytes()).map(|v| v.len()),
+            Some(1)
+        );
+        // 目录 → 不触发
+        assert!(upload_paths(dir.to_string_lossy().as_bytes()).is_none());
+        // 不存在的路径 → 不触发
+        assert!(upload_paths(b"definitely-not-exist-xyz").is_none());
+        // 普通命令文本 → 不触发
+        assert!(upload_paths(b"ls -la").is_none());
+        // 多路径其一不存在 → 不触发
+        let mixed = format!("{} nope-xyz", a.display());
+        assert!(upload_paths(mixed.as_bytes()).is_none());
+        // 引号包裹的含空格路径 → 触发
+        let spaced = dir.join("spaced file.txt");
+        std::fs::write(&spaced, "x").unwrap();
+        let quoted = format!("\"{}\"", spaced.display());
+        assert_eq!(
+            upload_paths(quoted.as_bytes()).map(|v| v.len()),
+            Some(1)
+        );
+        // 非法 UTF-8 → 不触发
+        assert!(upload_paths(&[0xff, 0xfe]).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 远端路径注入 shell 的引用规则：单引号字面量，`$`/反引号不展开，内部 `'` 转义
+    #[test]
+    fn quote_for_shell_rules() {
+        assert_eq!(quote_for_shell("/up/a.txt"), "'/up/a.txt'");
+        assert_eq!(quote_for_shell("/up/a b.txt"), "'/up/a b.txt'");
+        assert_eq!(quote_for_shell("/up/a\"b.txt"), "'/up/a\"b.txt'");
+        // 命令替换/变量展开在单引号内不生效（防恶意文件名注入）
+        assert_eq!(quote_for_shell("/up/$(reboot).txt"), "'/up/$(reboot).txt'");
+        assert_eq!(quote_for_shell("/up/`id`.txt"), "'/up/`id`.txt'");
+        assert_eq!(quote_for_shell("/up/$HOME.txt"), "'/up/$HOME.txt'");
+        // 内部单引号以 '\'' 转义
+        assert_eq!(quote_for_shell("/up/a'b.txt"), "'/up/a'\\''b.txt'");
+    }
 
     /// 无 ESC 前缀的应答残余（ConPTY/crossterm 吞掉 ESC 后逐键到达）应被吞掉
     #[test]

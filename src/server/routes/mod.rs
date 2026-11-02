@@ -2,6 +2,7 @@ pub mod admin;
 pub mod frontend;
 pub mod register;
 pub mod exec_ws;
+pub mod upload;
 
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
@@ -19,6 +20,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/api/register/status/{client_id}", get(register::status))
         .route("/api/exec/ws", get(exec_ws::exec_ws))
+        .route("/api/upload/ws", get(upload::upload_ws))
         .route("/api/admin/login", post(admin::login))
         .route("/api/admin/registrations", get(admin::registrations))
         .route("/api/admin/registrations/{id}/approve", post(admin::approve))

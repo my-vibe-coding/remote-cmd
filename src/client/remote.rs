@@ -252,6 +252,89 @@ pub async fn ws_exec(
     }
 }
 
+/// 上传单个文件到服务端：独立 WS 连接（复用 exec 的 TLS pin 校验与 X-Client-Token 认证）。
+/// 协议：init 文本帧（name/size）→ Binary 数据帧×N（64KB 分块）→ upload_end 文本帧
+/// → 服务端应答 uploaded（含远端绝对路径）/ rejected 文本帧。
+/// 服务端落地目录为其数据目录 uploads/ 下，同名自动加 _N 后缀，返回落地路径。
+pub async fn ws_upload(
+    server_url: &str,
+    token: &str,
+    name: &str,
+    size: u64,
+    file: &mut tokio::fs::File,
+    cert_sha256: Option<&str>,
+) -> Result<String> {
+    use tokio::io::AsyncReadExt as _;
+
+    if name.is_empty() {
+        anyhow::bail!("文件名为空");
+    }
+    let url = server_url
+        .replacen("https://", "wss://", 1)
+        .replacen("http://", "ws://", 1);
+    let mut request = format!("{url}/api/upload/ws").into_client_request()?;
+    request
+        .headers_mut()
+        .insert("X-Client-Token", token.parse().map_err(|_| anyhow::anyhow!("token 含非法字符"))?);
+
+    let (ws, _) = match connect_async_tls_with_config(
+        request,
+        None,
+        false,
+        Some(tls_connector(cert_sha256.and_then(parse_pin), None)),
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            crate::dlog!("[upload] TLS/WS 连接失败: {e}");
+            anyhow::bail!("{e}");
+        }
+    };
+    let (mut sink, mut stream) = ws.split();
+
+    let init = serde_json::json!({ "type": "upload", "name": name, "size": size });
+    sink.send(WsMessage::Text(init.to_string().into())).await?;
+
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        sink.send(WsMessage::Binary(buf[..n].to_vec().into())).await?;
+    }
+    sink.send(WsMessage::Text(serde_json::json!({ "type": "upload_end" }).to_string().into()))
+        .await?;
+
+    loop {
+        match stream.next().await {
+            Some(Ok(WsMessage::Text(t))) => {
+                let v: Value = serde_json::from_str(&t)?;
+                match v["type"].as_str() {
+                    Some("uploaded") => {
+                        let path = v["path"].as_str().unwrap_or_default().to_string();
+                        if path.is_empty() {
+                            anyhow::bail!("服务端未返回落地路径");
+                        }
+                        let _ = sink.close().await;
+                        return Ok(path);
+                    }
+                    Some("rejected") => {
+                        anyhow::bail!("{}", v["reason"].as_str().unwrap_or("上传被拒绝"));
+                    }
+                    _ => {
+                        crate::dlog!("[upload] 收到未预期的文本帧: {t}");
+                    }
+                }
+            }
+            Some(Ok(_)) => {} // 其它帧（Ping/Pong 等）忽略
+            Some(Err(e)) => anyhow::bail!("上传连接错误: {e}"),
+            None => anyhow::bail!("上传连接被服务端关闭"),
+        }
+    }
+}
+
 /// WS 帧类型 trace 日志（联调用）：控制帧（Ping/Pong/Close）逐帧记录，用于定位心跳与断连问题。
 /// 返回是否为控制帧（控制帧不进入 parse_frame 的应用层解析，调用方据此区分"无法解析"）。
 pub fn trace_frame(frame: &WsMessage) -> bool {
