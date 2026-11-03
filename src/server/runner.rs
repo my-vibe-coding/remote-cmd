@@ -60,19 +60,22 @@ pub fn spawn_exec_stdin(
     mpsc::Receiver<ExecEvent>,
     mpsc::Sender<StdinMsg>,
     tokio::sync::watch::Sender<bool>,
+    tokio::sync::watch::Receiver<Option<u32>>,
 ) {
     let (tx, rx) = mpsc::channel::<ExecEvent>(256);
     let (stx, srx) = mpsc::channel::<StdinMsg>(32);
     let (kill_tx, kill_rx) = tokio::sync::watch::channel(false);
+    // 子进程 pid 上报：spawn 成功后置 Some（上传路由据此读取 shell 进程 cwd）
+    let (pid_tx, pid_rx) = tokio::sync::watch::channel(None);
     let stx_pty = stx.clone();
     tokio::spawn(async move {
         if req.tty {
-            run_pty(req, tx, stx_pty, srx, tty_size, kill_rx).await;
+            run_pty(req, tx, stx_pty, srx, tty_size, kill_rx, pid_tx).await;
         } else {
-            run(req, tx, srx, kill_rx).await;
+            run(req, tx, srx, kill_rx, pid_tx).await;
         }
     });
-    (rx, stx, kill_tx)
+    (rx, stx, kill_tx, pid_rx)
 }
 
 async fn run(
@@ -80,6 +83,7 @@ async fn run(
     tx: mpsc::Sender<ExecEvent>,
     mut stdin_rx: mpsc::Receiver<StdinMsg>,
     mut kill_rx: tokio::sync::watch::Receiver<bool>,
+    pid_tx: tokio::sync::watch::Sender<Option<u32>>,
 ) {
     let started = Instant::now();
     let truncated = Arc::new(AtomicBool::new(false));
@@ -107,6 +111,7 @@ async fn run(
             return;
         }
     };
+    let _ = pid_tx.send(child.id());
 
     // stdin writer 任务：消费 StdinMsg → 写入子进程；EOF 后 shutdown 产生 EOF 并排空后续消息
     let mut child_stdin = child.stdin.take();
@@ -427,6 +432,7 @@ async fn run_pty(
     mut stdin_rx: mpsc::Receiver<StdinMsg>,
     tty_size: Option<(u16, u16)>,
     mut kill_rx: tokio::sync::watch::Receiver<bool>,
+    pid_tx: tokio::sync::watch::Sender<Option<u32>>,
 ) {
     use portable_pty::{CommandBuilder, PtySize};
 
@@ -474,6 +480,7 @@ async fn run_pty(
             return;
         }
     };
+    let _ = pid_tx.send(child.process_id());
     drop(pair.slave); // 父进程立即释放 slave 端
     macro_log::d!(
         "[pty] 服务端会话已启动 {} size={:?} 初次握手查询将由兜底应答",
@@ -817,7 +824,7 @@ mod tests {
             tty: false,
         };
 
-        let (mut rx, tx, _kill) = spawn_exec_stdin(req, None);
+        let (mut rx, tx, _kill, _pid_rx) = spawn_exec_stdin(req, None);
         tx.send(StdinMsg::Data(b"hello stdin\n".to_vec())).await.unwrap();
         tx.send(StdinMsg::Eof).await.unwrap();
         drop(tx);
@@ -858,7 +865,7 @@ mod tests {
             tty: true,
         };
 
-        let (mut rx, _tx, _kill) = spawn_exec_stdin(req, None);
+        let (mut rx, _tx, _kill, _pid_rx) = spawn_exec_stdin(req, None);
         let mut output = String::new();
         let mut exit_code = None;
         let completed = tokio::time::timeout(std::time::Duration::from_secs(10), async {

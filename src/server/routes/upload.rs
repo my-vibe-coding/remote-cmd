@@ -17,10 +17,10 @@ use crate::server::state::AppState;
 const MAX_UPLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// GET /api/upload/ws：WS 连接即单文件上传会话（upgrade 前经 ClientAuth 认证）。
-/// 协议：init 文本帧（name/size）→ Binary 数据帧×N → upload_end 文本帧
+/// 协议：init 文本帧（name/size/session）→ Binary 数据帧×N → upload_end 文本帧
 /// → 应答 uploaded（path = 落地绝对路径）/ rejected 文本帧。
 /// 客户端由 PTY 会话的拖放/粘贴路径检测触发（见 client/run_cmd.rs），文件落地
-/// 服务端数据目录 uploads/ 下，同名自动加 _N 后缀，不做覆盖。
+/// Unix 时优先所传会话 shell 进程 cwd、否则数据目录 uploads/ 下，同名自动加 _N 后缀，不做覆盖。
 pub async fn upload_ws(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -33,10 +33,27 @@ pub async fn upload_ws(
 #[derive(Deserialize)]
 struct UploadInit {
     name: String,
+    /// 发起上传的 exec 会话 id：服务端据此定位该会话 shell 进程 cwd 作为落地目录
+    #[serde(default)]
+    session: String,
 }
 
 fn rejected(reason: &str) -> Message {
     Message::Text(serde_json::json!({ "type": "rejected", "reason": reason }).to_string().into())
+}
+
+/// 上传落地目录：Unix 优先取所传 exec 会话（shell）进程的 cwd
+/// （拖放上传语义 = 文件落在 shell 当前工作目录）；会话 id 缺失/未知/归属客户端
+/// 不符、/proc 读取失败（进程已退出/pid 复用防护）或 Windows 服务端 → 默认 uploads 目录
+fn upload_dir(state: &AppState, client_id: &str, session: Option<&str>) -> PathBuf {
+    if let Some(session) = session
+        && let Some(pid) = state.pty_pid(session, client_id)
+        && let Ok(cwd) = crate::common::cwd::get_cwd(pid)
+    {
+        macro_log::d!("[upload] 使用会话 {session} 进程 cwd: pid={pid} dir={cwd}");
+        return PathBuf::from(cwd);
+    }
+    state.data_dir.join("uploads")
 }
 
 async fn session(
@@ -48,7 +65,7 @@ async fn session(
     let hostname = client.hostname.clone();
 
     // init 帧（15s 超时）
-    let name = match tokio::time::timeout(Duration::from_secs(15), read_init(&mut socket)).await {
+    let init = match tokio::time::timeout(Duration::from_secs(15), read_init(&mut socket)).await {
         Ok(Ok(v)) => v,
         Ok(Err(reason)) => {
             let _ = socket.send(rejected(&reason)).await;
@@ -63,14 +80,17 @@ async fn session(
     };
 
     // 文件名净化：仅保留文件名部分，拒绝空/特殊名/控制字符（防路径穿越）
-    let Some(name) = sanitize_name(&name) else {
+    let Some(name) = sanitize_name(&init.name) else {
         let _ = socket.send(rejected("文件名非法")).await;
         let _ = socket.close().await;
         return;
     };
 
-    // 落地目录：<data_dir>/uploads；同名加 _N 后缀，不覆盖已有文件
-    let dir = state.data_dir.join("uploads");
+    // 落地目录：Unix 优先取该客户端 exec 会话（shell）进程的 cwd——拖放上传语义
+    // 即"文件落在 shell 当前工作目录"；会话 id 无效/读取失败/Windows → 默认 uploads 目录。
+    // 同名加 _N 后缀，不覆盖已有文件。
+    let session = (!init.session.is_empty()).then_some(init.session.as_str());
+    let dir = upload_dir(&state, &client.id, session);
     if let Err(e) = tokio::fs::create_dir_all(&dir).await {
         macro_log::w!("[upload] 创建上传目录失败 {}: {e}", dir.display());
         let _ = socket.send(rejected("服务端上传目录创建失败")).await;
@@ -138,7 +158,7 @@ async fn session(
     state.audit.log(
         "file.upload",
         &hostname,
-        Some(serde_json::json!({ "name": name, "bytes": total, "path": path, "ip": addr.ip().to_string() })),
+        Some(serde_json::json!({ "name": name, "bytes": total, "path": path, "dir": dir.display().to_string(), "ip": addr.ip().to_string() })),
     );
     let _ = socket
         .send(Message::Text(
@@ -149,12 +169,12 @@ async fn session(
     macro_log::d!("[upload] 接收完成 {name} ({total} bytes) -> {path} from {hostname}");
 }
 
-async fn read_init(socket: &mut WebSocket) -> Result<String, String> {
+async fn read_init(socket: &mut WebSocket) -> Result<UploadInit, String> {
     loop {
         match socket.recv().await {
             Some(Ok(Message::Text(t))) => {
                 let v: UploadInit = serde_json::from_str(&t).map_err(|e| format!("init 帧无效: {e}"))?;
-                return Ok(v.name);
+                return Ok(v);
             }
             Some(Ok(_)) => return Err("首帧必须为 init".into()),
             Some(Err(e)) => return Err(format!("连接错误: {e}")),

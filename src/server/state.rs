@@ -26,6 +26,16 @@ pub struct AppState {
     pub global_sem: Arc<Semaphore>,
     /// 每凭证并发执行上限
     pub per_client_sem: Mutex<HashMap<String, Arc<Semaphore>>>,
+    /// 活跃 exec 会话的子进程 pid，按会话 id 寻址：文件上传路由凭 init 帧携带的
+    /// session_id 读取 shell 进程 cwd，使拖放上传落地该会话 shell 的工作目录；
+    /// 查询时校验归属客户端，防跨客户端冒用会话 id
+    pub pty_pids: Mutex<HashMap<String, PtyPidEntry>>,
+}
+
+/// 会话 pid 登记项
+pub struct PtyPidEntry {
+    pub client_id: String,
+    pub pid: u32,
 }
 
 impl AppState {
@@ -43,6 +53,7 @@ impl AppState {
             rate: RateLimiter::new(),
             global_sem: Arc::new(Semaphore::new(Self::GLOBAL_EXEC_LIMIT)),
             per_client_sem: Mutex::new(HashMap::new()),
+            pty_pids: Mutex::new(HashMap::new()),
         }
     }
 
@@ -68,5 +79,28 @@ impl AppState {
             .entry(client_id.to_string())
             .or_insert_with(|| Arc::new(Semaphore::new(Self::PER_CLIENT_EXEC_LIMIT)))
             .clone()
+    }
+
+    /// 登记活跃会话的子进程 pid（会话建立后调用）
+    pub fn set_pty_pid(&self, session_id: &str, client_id: &str, pid: u32) {
+        self.pty_pids.lock().unwrap().insert(
+            session_id.to_string(),
+            PtyPidEntry {
+                client_id: client_id.to_string(),
+                pid,
+            },
+        );
+    }
+
+    /// 会话结束时移除登记
+    pub fn clear_pty_pid(&self, session_id: &str) {
+        self.pty_pids.lock().unwrap().remove(session_id);
+    }
+
+    /// 查询会话的子进程 pid；归属客户端不符视为未知（防冒用）
+    pub fn pty_pid(&self, session_id: &str, client_id: &str) -> Option<u32> {
+        let pids = self.pty_pids.lock().unwrap();
+        let entry = pids.get(session_id)?;
+        (entry.client_id == client_id).then_some(entry.pid)
     }
 }

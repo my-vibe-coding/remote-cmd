@@ -107,7 +107,7 @@ async fn session(mut socket: WebSocket, state: Arc<AppState>, client: crate::ser
         (Some(c), Some(r)) if c > 0 && r > 0 && c <= 1024 && r <= 1024 => Some((c, r)),
         _ => None,
     };
-    let (mut rx, stdin_tx, kill_tx) = runner::spawn_exec_stdin(
+    let (mut rx, stdin_tx, kill_tx, mut pid_rx) = runner::spawn_exec_stdin(
         ExecRequest {
             program: init.program.clone(),
             args: init.args.clone(),
@@ -117,7 +117,28 @@ async fn session(mut socket: WebSocket, state: Arc<AppState>, client: crate::ser
         tty_size,
     );
 
-    if socket.send(Message::Text(serde_json::json!({ "type": "started" }).to_string().into())).await.is_err() {
+    // 会话 id：随 started 帧下发，客户端上传 init 帧回传，服务端据此定位本会话
+    // shell 进程 cwd（拖放上传落地工作目录）；并发会话各持独立 pid，互不干扰
+    let session_id = crate::common::crypto::random_token();
+    {
+        let state_pid = Arc::clone(&state);
+        let client_id_pid = client.id.clone();
+        let session_id_pid = session_id.clone();
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(Duration::from_secs(5), pid_rx.changed()).await;
+            if let Some(pid) = *pid_rx.borrow() {
+                state_pid.set_pty_pid(&session_id_pid, &client_id_pid, pid);
+            }
+        });
+    }
+
+    if socket
+        .send(Message::Text(
+            serde_json::json!({ "type": "started", "session_id": session_id }).to_string().into(),
+        ))
+        .await
+        .is_err()
+    {
         macro_log::w!("[ws] started 帧发送失败，终止会话: {}", init.program);
         return; // rx 随函数返回被 drop → 子进程被 kill
     }
@@ -224,6 +245,7 @@ async fn session(mut socket: WebSocket, state: Arc<AppState>, client: crate::ser
     // 上行结束（客户端断连）：关闭 stdin 通道并触发 kill → 执行器终止子进程后发送 Exit 终态，
     // downlink 完成审计/历史写入后自然退出（原先直接 abort 下行会丢断连会话的 exec.finish）。
     drop(stdin_tx);
+    state.clear_pty_pid(&session_id); // 移除会话 pid 登记，防 pid 复用导致 cwd 误读
     let _ = kill_tx.send(true);
     macro_log::d!("[ws] 已触发会话终止信号，等待下行收尾: {}", program);
     // 兜底：执行器各退出路径均会发送 Exit；限时等待防止许可被意外长期占用

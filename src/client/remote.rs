@@ -43,6 +43,9 @@ pub struct ExecWs {
     pub sink:
         futures::stream::SplitSink<WsStream, WsMessage>,
     pub stream: futures::stream::SplitStream<WsStream>,
+    /// 服务端会话 id（随 started 帧下发）：上传 init 帧回传，服务端据此定位
+    /// 本会话 shell 进程 cwd，使拖放上传落地 shell 工作目录
+    pub session_id: String,
 }
 
 /// 服务端 → 客户端的执行事件帧
@@ -224,8 +227,9 @@ pub async fn ws_exec(
                 let v: Value = serde_json::from_str(&t)?;
                 match v["type"].as_str() {
                     Some("started") => {
-                        crate::dlog!("[ws] 服务端已确认会话启动（started）");
-                        return Ok(ExecWs { sink, stream });
+                        let session_id = v["session_id"].as_str().unwrap_or_default().to_string();
+                        crate::dlog!("[ws] 服务端已确认会话启动（started）session_id={session_id}");
+                        return Ok(ExecWs { sink, stream, session_id });
                     }
                     Some("rejected") => {
                         crate::dlog!("[ws] 服务端拒绝会话: {}", v["reason"].as_str().unwrap_or(""));
@@ -253,15 +257,17 @@ pub async fn ws_exec(
 }
 
 /// 上传单个文件到服务端：独立 WS 连接（复用 exec 的 TLS pin 校验与 X-Client-Token 认证）。
-/// 协议：init 文本帧（name/size）→ Binary 数据帧×N（64KB 分块）→ upload_end 文本帧
+/// 协议：init 文本帧（name/size/session）→ Binary 数据帧×N（64KB 分块）→ upload_end 文本帧
 /// → 服务端应答 uploaded（含远端绝对路径）/ rejected 文本帧。
-/// 服务端落地目录为其数据目录 uploads/ 下，同名自动加 _N 后缀，返回落地路径。
+/// 落地目录：Unix 优先所传 exec 会话 shell 的 cwd，否则数据目录 uploads/ 下；
+/// 同名自动加 _N 后缀，返回落地路径。
 pub async fn ws_upload(
     server_url: &str,
     token: &str,
     name: &str,
     size: u64,
     file: &mut tokio::fs::File,
+    session_id: &str,
     cert_sha256: Option<&str>,
 ) -> Result<String> {
     use tokio::io::AsyncReadExt as _;
@@ -293,7 +299,8 @@ pub async fn ws_upload(
     };
     let (mut sink, mut stream) = ws.split();
 
-    let init = serde_json::json!({ "type": "upload", "name": name, "size": size });
+    // session_id：服务端据此定位发起上传的 exec 会话 shell 进程 cwd（落地工作目录）
+    let init = serde_json::json!({ "type": "upload", "name": name, "size": size, "session": session_id });
     sink.send(WsMessage::Text(init.to_string().into())).await?;
 
     let mut buf = vec![0u8; 64 * 1024];

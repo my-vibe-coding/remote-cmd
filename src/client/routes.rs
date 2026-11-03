@@ -397,7 +397,6 @@ async fn exec(Json(body): Json<ExecBody>) -> Result<Response, (StatusCode, Strin
 
     let (server, payload) = crate::client::run_cmd::resolve_exec_target(&body.alias, &body.args)
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
-    let token = server.token.clone().unwrap_or_default();
     let program = payload["program"].as_str().unwrap_or_default().to_string();
     let args: Vec<String> = serde_json::from_value(payload["args"].clone())
         .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
@@ -498,8 +497,7 @@ async fn exec_pty_bridge(
     use futures::{SinkExt as _, StreamExt as _};
     use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-    let token = server.token.clone().unwrap_or_default();
-    let ExecWs { sink: mut rtx, stream: mut rrx } =
+    let ExecWs { sink: mut rtx, stream: mut rrx, .. } =
         match crate::client::run_cmd::ws_exec_recovered(&server, &program, &args, true, tty_size)
             .await
         {

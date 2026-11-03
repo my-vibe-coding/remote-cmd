@@ -35,7 +35,7 @@ pub async fn run(alias: &str, args: &[String], verbose: bool) -> Result<()> {
     let pty = std::io::stdin().is_terminal();
     // PTY 会话：本地尺寸随 init 帧上报（服务端按此创建 PTY，避免 80x24 初始竞态）
     let tty_size = if pty { crossterm::terminal::size().ok() } else { None };
-    let ExecWs { sink, stream } = match ws_exec_recovered(&server, &program, &cmd_args, pty, tty_size)
+    let ExecWs { sink, stream, session_id } = match ws_exec_recovered(&server, &program, &cmd_args, pty, tty_size)
         .await
     {
         Ok(w) => w,
@@ -43,7 +43,7 @@ pub async fn run(alias: &str, args: &[String], verbose: bool) -> Result<()> {
     };
 
     if pty {
-        return run_pty_session(sink, stream, verbose, server).await;
+        return run_pty_session(sink, stream, verbose, server, session_id).await;
     }
 
     // 管道 stdin → 转发原始字节，EOF 时发 stdin_close
@@ -166,6 +166,7 @@ async fn run_pty_session(
     mut stream: futures::stream::SplitStream<super::remote::WsStream>,
     verbose: bool,
     server: ServerReg,
+    session_id: String,
 ) -> Result<()> {
     use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 
@@ -239,6 +240,8 @@ async fn run_pty_session(
     let upload_url = server.server_url.clone();
     let upload_token = server.token.clone().unwrap_or_default();
     let upload_cert = server.cert_sha256.clone();
+    // 上传 init 帧回传 session_id：服务端据此定位本会话 shell 进程 cwd（落地工作目录）
+    let upload_session = session_id;
     let forward = tokio::spawn(async move {
         let mut ping = tokio::time::interval(PING_INTERVAL);
         loop {
@@ -294,7 +297,7 @@ async fn run_pty_session(
                                 let size = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
                                 let res = match tokio::fs::File::open(f).await {
                                     Ok(mut file) => {
-                                        ws_upload(&upload_url, &upload_token, &name, size, &mut file, upload_cert.as_deref())
+                                        ws_upload(&upload_url, &upload_token, &name, size, &mut file, &upload_session, upload_cert.as_deref())
                                             .await
                                     }
                                     Err(e) => Err(anyhow!("本地文件打开失败: {e}")),
