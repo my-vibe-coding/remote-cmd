@@ -42,15 +42,16 @@ fn rejected(reason: &str) -> Message {
     Message::Text(serde_json::json!({ "type": "rejected", "reason": reason }).to_string().into())
 }
 
-/// 上传落地目录：Unix 优先取所传 exec 会话（shell）进程的 cwd
-/// （拖放上传语义 = 文件落在 shell 当前工作目录）；会话 id 缺失/未知/归属客户端
-/// 不符、/proc 读取失败（进程已退出/pid 复用防护）或 Windows 服务端 → 默认 uploads 目录
-fn upload_dir(state: &AppState, client_id: &str, session: Option<&str>) -> PathBuf {
+/// 上传落地目录：Unix 经 cwd 解析链取所传 exec 会话（shell）进程的 cwd
+/// （tmux 感知：tmux 内 cd 后取活动 pane 实时 cwd，见 common/cwd.rs；拖放上传语义
+/// = 文件落在 shell 当前工作目录）；会话 id 缺失/未知/归属客户端不符、解析失败
+/// 或 Windows 服务端 → 默认 uploads 目录
+async fn upload_dir(state: &AppState, client_id: &str, session: Option<&str>) -> PathBuf {
     if let Some(session) = session
         && let Some(pid) = state.pty_pid(session, client_id)
-        && let Ok(cwd) = crate::common::cwd::get_cwd(pid)
+        && let Some(cwd) = crate::common::cwd::resolve_process_cwd(pid).await
     {
-        macro_log::d!("[upload] 使用会话 {session} 进程 cwd: pid={pid} dir={cwd}");
+        macro_log::d!("[upload] 落地进程 cwd: pid={pid} dir={cwd}");
         return PathBuf::from(cwd);
     }
     state.data_dir.join("uploads")
@@ -90,7 +91,7 @@ async fn session(
     // 即"文件落在 shell 当前工作目录"；会话 id 无效/读取失败/Windows → 默认 uploads 目录。
     // 同名加 _N 后缀，不覆盖已有文件。
     let session = (!init.session.is_empty()).then_some(init.session.as_str());
-    let dir = upload_dir(&state, &client.id, session);
+    let dir = upload_dir(&state, &client.id, session).await;
     if let Err(e) = tokio::fs::create_dir_all(&dir).await {
         macro_log::w!("[upload] 创建上传目录失败 {}: {e}", dir.display());
         let _ = socket.send(rejected("服务端上传目录创建失败")).await;
