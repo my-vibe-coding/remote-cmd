@@ -19,6 +19,10 @@ const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 /// 失焦后突发输入的静默判定窗：拖放/粘贴的路径字节间隔 <1ms，静默 10ms 视为输入完毕
 const BURST_QUIET: std::time::Duration = std::time::Duration::from_millis(10);
 
+/// 应答判定滞留字节的空闲冲刷窗：应答序列逐字节间隔 <1ms，50ms 无后续即可判定
+/// 滞留字节（孤立的裸 `[` / ESC）为普通输入，冲刷转发避免其回显延迟到下一键
+const REPLY_FLUSH_IDLE: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// `remote-cmd run <别名> [args...]`：读取本地配置 → 模板渲染 → WS 会话 → stdin 转发 + 流式输出 → 透传退出码。
 /// `verbose=false`（别名 shim 模式）时抑制 stderr 提示信息，避免污染包装脚本的输出处理。
 pub async fn run(alias: &str, args: &[String], verbose: bool) -> Result<()> {
@@ -239,79 +243,95 @@ async fn run_pty_session(
         let mut ping = tokio::time::interval(PING_INTERVAL);
         loop {
             let msg = tokio::select! {
-                a = irx.recv() => match a {
-                    None => break,
-                    Some(InputAction::Data(d)) => match reply_filter.feed(&d) {
-                        filtered if filtered.is_empty() && !d.is_empty() => {
-                            crate::dlog!(
-                                "[pty-in] 客户端过滤器吞掉本地应答 {} 字节: {}",
-                                d.len(),
-                                crate::common::escape_bytes(&d)
-                            );
-                            continue; // 终端应答被吞掉，不转发远端
+                // 空闲冲刷：应答判定滞留字节（裸 `[` / ESC）超时无后续 → 按普通输入放行。
+                // 应答序列逐字节间隔 <1ms，50ms 静默后到达的字节不可能是其残余。
+                a = tokio::time::timeout(REPLY_FLUSH_IDLE, irx.recv()) => match a {
+                    Err(_) => {
+                        let pending = reply_filter.take_pending();
+                        if pending.is_empty() {
+                            continue;
                         }
-                        filtered => {
-                            if !d.is_empty() {
+                        crate::dlog!(
+                            "[pty-in] 空闲冲刷滞留判定字节 {} 字节: {}",
+                            pending.len(),
+                            crate::common::escape_bytes(&pending)
+                        );
+                        WsMessage::Binary(pending.into())
+                    }
+                    Ok(None) => break,
+                    Ok(Some(a)) => match a {
+                        InputAction::Data(d) => match reply_filter.feed(&d) {
+                            filtered if filtered.is_empty() && !d.is_empty() => {
                                 crate::dlog!(
-                                    "[pty-in] 客户端输入 {} 字节 -> 转发 {} 字节: {}",
+                                    "[pty-in] 客户端过滤器吞掉本地应答 {} 字节: {}",
                                     d.len(),
-                                    filtered.len(),
-                                    crate::common::escape_bytes(&filtered)
+                                    crate::common::escape_bytes(&d)
                                 );
+                                continue; // 终端应答被吞掉，不转发远端
                             }
-                            WsMessage::Binary(filtered.into())
-                        }
-                    },
-                    Some(InputAction::Upload { files, raw }) => {
-                        // 逐文件上传（独立 WS 连接）；全部成功 → 把远端路径注入远端 shell
-                        //（等价于用户在提示符处输入文件参数），任一失败 → 回退原文透传。
-                        let mut remote = Vec::with_capacity(files.len());
-                        let mut failed = false;
-                        for f in &files {
-                            let name = f
-                                .file_name()
-                                .map(|s| s.to_string_lossy().into_owned())
-                                .unwrap_or_default();
-                            let size = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
-                            let res = match tokio::fs::File::open(f).await {
-                                Ok(mut file) => {
-                                    ws_upload(&upload_url, &upload_token, &name, size, &mut file, upload_cert.as_deref())
-                                        .await
+                            filtered => {
+                                if !d.is_empty() {
+                                    crate::dlog!(
+                                        "[pty-in] 客户端输入 {} 字节 -> 转发 {} 字节: {}",
+                                        d.len(),
+                                        filtered.len(),
+                                        crate::common::escape_bytes(&filtered)
+                                    );
                                 }
-                                Err(e) => Err(anyhow!("本地文件打开失败: {e}")),
+                                WsMessage::Binary(filtered.into())
+                            }
+                        },
+                        InputAction::Upload { files, raw } => {
+                            // 逐文件上传（独立 WS 连接）；全部成功 → 把远端路径注入远端 shell
+                            //（等价于用户在提示符处输入文件参数），任一失败 → 回退原文透传。
+                            let mut remote = Vec::with_capacity(files.len());
+                            let mut failed = false;
+                            for f in &files {
+                                let name = f
+                                    .file_name()
+                                    .map(|s| s.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
+                                let size = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
+                                let res = match tokio::fs::File::open(f).await {
+                                    Ok(mut file) => {
+                                        ws_upload(&upload_url, &upload_token, &name, size, &mut file, upload_cert.as_deref())
+                                            .await
+                                    }
+                                    Err(e) => Err(anyhow!("本地文件打开失败: {e}")),
+                                };
+                                match res {
+                                    Ok(p) => remote.push(p),
+                                    Err(e) => {
+                                        crate::dlog!("[upload] {name} 上传失败: {e:#}");
+                                        failed = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            let text = if failed || remote.is_empty() {
+                                String::from_utf8_lossy(&raw).into_owned()
+                            } else {
+                                crate::dlog!("[upload] 已上传 {} 个文件: {}", remote.len(), remote.join(" "));
+                                remote.iter().map(|p| quote_for_shell(p)).collect::<Vec<_>>().join(" ")
                             };
-                            match res {
-                                Ok(p) => remote.push(p),
-                                Err(e) => {
-                                    crate::dlog!("[upload] {name} 上传失败: {e:#}");
-                                    failed = true;
-                                    break;
-                                }
+                            let filtered = reply_filter.feed(text.as_bytes());
+                            if sink.send(WsMessage::Binary(filtered.into())).await.is_err() {
+                                crate::dlog!("[pty-in] WS 发送失败（上传结果注入），输入转发终止");
+                                break;
                             }
+                            continue;
                         }
-                        let text = if failed || remote.is_empty() {
-                            String::from_utf8_lossy(&raw).into_owned()
-                        } else {
-                            crate::dlog!("[upload] 已上传 {} 个文件: {}", remote.len(), remote.join(" "));
-                            remote.iter().map(|p| quote_for_shell(p)).collect::<Vec<_>>().join(" ")
-                        };
-                        let filtered = reply_filter.feed(text.as_bytes());
-                        if sink.send(WsMessage::Binary(filtered.into())).await.is_err() {
-                            crate::dlog!("[pty-in] WS 发送失败（上传结果注入），输入转发终止");
+                        InputAction::Resize(c, r) => {
+                            crate::dlog!("[pty-in] 客户端上报终端尺寸 {}x{}", c, r);
+                            resize_msg(c, r)
+                        }
+                        InputAction::Detach => {
+                            crate::dlog!("[pty-in] 客户端脱离会话（Ctrl+]）");
+                            let _ = detach_tx.send(()).await;
+                            // 先发 WS Close 帧让服务端感知正常关闭（不等待回复，随后立即退出）
+                            let _ = sink.close().await;
                             break;
                         }
-                        continue;
-                    }
-                    Some(InputAction::Resize(c, r)) => {
-                        crate::dlog!("[pty-in] 客户端上报终端尺寸 {}x{}", c, r);
-                        resize_msg(c, r)
-                    }
-                    Some(InputAction::Detach) => {
-                        crate::dlog!("[pty-in] 客户端脱离会话（Ctrl+]）");
-                        let _ = detach_tx.send(()).await;
-                        // 先发 WS Close 帧让服务端感知正常关闭（不等待回复，随后立即退出）
-                        let _ = sink.close().await;
-                        break;
                     }
                 },
                 _ = ping.tick() => {
@@ -750,6 +770,13 @@ impl ReplyFilter {
         out
     }
 
+    /// 取出滞留的判定字节并复位到普通状态（空闲超时冲刷用）：
+    /// 孤立的裸 `[` / ESC 不应无限期滞留到下一次输入才放行
+    fn take_pending(&mut self) -> Vec<u8> {
+        self.state = FilterState::Normal;
+        std::mem::take(&mut self.pending)
+    }
+
     /// 判定已收集的完整 CSI 序列是否为终端应答（pending = ESC [ params... final）。
     /// 保险网：查询已在服务端输出流被丢弃，此处覆盖兜底漏网时的宿主终端应答形态。
     fn is_reply_sequence(&self) -> bool {
@@ -1138,6 +1165,25 @@ mod tests {
         assert_eq!(f.feed(b"\x1b[1;1Rabc"), b"abc"); // 应答后接普通输入
         assert_eq!(f.feed(b"\x1bo"), b"\x1bo"); // ESC+非序列字符（Alt+o）
         assert_eq!(f.feed(b"\x1b"), b""); // 悬空 ESC 留待下批
+    }
+
+    /// 空闲冲刷：滞留判定字节（裸 [ / 悬空 ESC）取出后状态复位，后续输入正常分类
+    #[test]
+    fn reply_filter_take_pending_flushes_and_resets() {
+        // 裸 [ 滞留
+        let mut f = ReplyFilter::new();
+        assert_eq!(f.feed(b"["), b"");
+        assert_eq!(f.take_pending(), b"[");
+        // 复位后普通输入不受影响
+        assert_eq!(f.feed(b"abc"), b"abc");
+        // 悬空 ESC 滞留
+        let mut f = ReplyFilter::new();
+        assert_eq!(f.feed(b"\x1b"), b"");
+        assert_eq!(f.take_pending(), b"\x1b");
+        assert_eq!(f.feed(b"\x1b[A"), b"\x1b[A"); // 复位后方向键仍完整放行
+        // 无滞留时冲刷返回空
+        let mut f = ReplyFilter::new();
+        assert_eq!(f.take_pending(), b"");
     }
 
     /// 端到端验证别名模板渲染：REMOTE_CMD_HOME 隔离 + 写入别名与服务器配置
