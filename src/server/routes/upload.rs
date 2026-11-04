@@ -101,11 +101,10 @@ async fn session(
         let _ = socket.close().await;
         return;
     }
-    let dest = unique_path(dir.join(&name));
-    let mut file = match tokio::fs::File::create(&dest).await {
-        Ok(f) => f,
+    let (dest, mut file) = match open_unique_file(&dir, &name).await {
+        Ok(v) => v,
         Err(e) => {
-            macro_log::w!("[upload] 创建文件失败 {}: {e}", dest.display());
+            macro_log::w!("[upload] 创建文件失败 {}/{}: {e}", dir.display(), name);
             let _ = socket.send(rejected("服务端文件写入失败")).await;
             let _ = socket.close().await;
             return;
@@ -199,26 +198,40 @@ fn sanitize_name(raw: &str) -> Option<String> {
     Some(name.to_string())
 }
 
-/// 同名不覆盖：`a.txt` 已存在 → `a_1.txt`、`a_2.txt` …
-fn unique_path(dest: PathBuf) -> PathBuf {
-    if !dest.exists() {
-        return dest;
+/// 原子创建不覆盖的落地文件：`create_new`（不存在才创建）替代 exists+create 两步
+/// 操作，消除同名并发上传的 TOCTOU 竞态（先查后建互相截断）。冲突时加 _N 后缀重试。
+fn create_new_opts() -> tokio::fs::OpenOptions {
+    let mut o = tokio::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    o
+}
+
+async fn open_unique_file(dir: &std::path::Path, name: &str) -> std::io::Result<(PathBuf, tokio::fs::File)> {
+    // 首选原名
+    let dest = dir.join(name);
+    match create_new_opts().open(&dest).await {
+        Ok(f) => return Ok((dest, f)),
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
+        _ => {}
     }
-    let stem = dest
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let ext = dest
-        .extension()
-        .map(|s| format!(".{}", s.to_string_lossy()))
-        .unwrap_or_default();
+    // 同名冲突：a.txt → a_1.txt、a_2.txt …（create_new 原子抢位，天然并发安全）
+    // 隐藏文件（.gitignore）整体视为无扩展名
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, _)) if !stem.is_empty() => (&name[..stem.len()], &name[stem.len()..]),
+        _ => (name, ""),
+    };
     for i in 1..1000u32 {
-        let cand = dest.with_file_name(format!("{stem}_{i}{ext}"));
-        if !cand.exists() {
-            return cand;
+        let cand = dir.join(format!("{stem}_{i}{ext}"));
+        match create_new_opts().open(&cand).await {
+            Ok(f) => return Ok((cand, f)),
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
+            _ => {}
         }
     }
-    dest.with_file_name(format!("{stem}_{}{ext}", chrono::Utc::now().timestamp_millis()))
+    // 兜底：时间戳名（1000 个后缀占满的极端场景）
+    let cand = dir.join(format!("{stem}_{}{ext}", chrono::Utc::now().timestamp_millis()));
+    let f = create_new_opts().open(&cand).await?;
+    Ok((cand, f))
 }
 
 /// 落地路径展示：canonicalize 取绝对路径；剥离 Windows `\\?\` 前缀
@@ -245,19 +258,39 @@ mod tests {
         assert_eq!(sanitize_name("a\u{0}b"), None);
     }
 
-    #[test]
-    fn unique_path_appends_suffix_without_overwrite() {
+    /// 原子不覆盖创建：同名自动 _N 后缀，已有文件内容不被截断（create_new 语义）
+    #[tokio::test]
+    async fn open_unique_file_creates_without_overwrite() {
         let dir = std::env::temp_dir().join(format!("rc-upload-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let base = dir.join("a.txt");
-        std::fs::write(&base, "x").unwrap();
-        assert_eq!(unique_path(base.clone()), dir.join("a_1.txt"));
-        std::fs::write(dir.join("a_1.txt"), "x").unwrap();
-        assert_eq!(unique_path(base), dir.join("a_2.txt"));
-        // 无扩展名
-        let noext = dir.join("b");
-        std::fs::write(&noext, "x").unwrap();
-        assert_eq!(unique_path(noext), dir.join("b_1"));
+
+        // 首选原名创建
+        let (p1, mut f1) = open_unique_file(&dir, "a.txt").await.unwrap();
+        assert_eq!(p1, dir.join("a.txt"));
+        use tokio::io::AsyncWriteExt as _;
+        f1.write_all(b"original").await.unwrap();
+        f1.sync_all().await.unwrap();
+
+        // 同名 → a_1.txt；原文件内容不被截断
+        let (p2, f2) = open_unique_file(&dir, "a.txt").await.unwrap();
+        assert_eq!(p2, dir.join("a_1.txt"));
+        drop(f2);
+        assert_eq!(std::fs::read(dir.join("a.txt")).unwrap(), b"original");
+
+        // 无扩展名 → b_1
+        let (p3, f3) = open_unique_file(&dir, "b").await.unwrap();
+        assert_eq!(p3, dir.join("b"));
+        drop(f3);
+        // 隐藏文件整体视为无扩展名：先占用原名 → 后缀
+        std::fs::write(dir.join(".gitignore"), "x").unwrap();
+        let (p4, f4) = open_unique_file(&dir, ".gitignore").await.unwrap();
+        assert_eq!(p4, dir.join(".gitignore_1"));
+        drop(f4);
+        // 后缀计数中断续接：再建一个 a.txt → a_2.txt
+        let (p5, f5) = open_unique_file(&dir, "a.txt").await.unwrap();
+        assert_eq!(p5, dir.join("a_2.txt"));
+        drop(f5);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

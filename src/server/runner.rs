@@ -410,6 +410,7 @@ fn is_query_csi(seq: &[u8]) -> bool {
 
 /// 判定完整 OSC 序列是否为颜色查询。兼容批量发送（vim 将多条 OSC 查询共享一个终结符：
 /// `ESC]10;?ESC]11;?BEL`），内容中出现任一 "10;?" / "11;?" 即视为查询。
+#[allow(unused)]
 fn contains_color_query(body: &[u8]) -> bool {
     let pat10 = b"10;?";
     let pat11 = b"11;?";
