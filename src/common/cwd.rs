@@ -71,22 +71,42 @@ pub async fn resolve_process_cwd(_pid: u32) -> Option<String> {
     None
 }
 
-/// tmux 活动 pane cwd 探测与查询；任何一步失败返回 None（调用方降级）
+/// tmux 活动 pane cwd 探测与查询；任何一步失败返回 None（调用方降级）。
+/// 全链路 dlog 诊断：降级时能看到具体卡在哪一步
 #[cfg(unix)]
 async fn tmux_pane_cwd(shell_pid: u32) -> Option<String> {
-    // 候选：shell 本身（exec tmux 场景）与其直接子进程（bash fork tmux 场景）。
+    // 在全进程表中按控制终端匹配 tmux 客户端（详见 find_tmux_client）：
     // tmux 客户端与 shell 共享外层 PTY 的控制终端；tmux server 守护化后无控制终端，
     // 不会被命中。tmux new -d（分离创建）客户端立即退出，探不到 → 自然走普通 cwd。
-    let shell_tty = proc_tty_nr(shell_pid)?;
-    let mut candidates = vec![shell_pid];
-    candidates.extend(children_of(shell_pid));
-    let client = candidates.into_iter().find(|&p| {
-        proc_comm(p).as_deref() == Some("tmux") && proc_tty_nr(p) == Some(shell_tty)
-    })?;
+    let shell_tty = match proc_tty_nr(shell_pid) {
+        Some(t) => t,
+        None => {
+            macro_log::d!("[cwd] tmux 探测跳过: shell {shell_pid} 的 /proc stat 不可读");
+            return None;
+        }
+    };
+    let Some(client) = find_tmux_client(shell_tty) else {
+        macro_log::d!("[cwd] tmux 探测: 全进程表未发现 tty={shell_tty} 的 tmux 客户端");
+        return None;
+    };
+    macro_log::d!("[cwd] tmux 客户端 pid={client}");
 
-    let tmux_env = proc_environ_kv(client, "TMUX")?;
-    let (socket, target) = parse_tmux_env(&tmux_env)?;
-    query_tmux_pane_cwd(&socket, target).await
+    let Some(tmux_env) = proc_environ_kv(client, "TMUX") else {
+        macro_log::d!("[cwd] tmux 客户端 {client} 环境中无 TMUX 变量");
+        return None;
+    };
+    let Some((socket, env_target)) = parse_tmux_env(&tmux_env) else {
+        macro_log::d!("[cwd] TMUX env 解析失败: {tmux_env:?}");
+        return None;
+    };
+    // 目标会话：优先 list-clients 按控制终端实时匹配（覆盖 attach / switch-client
+    // 后 TMUX env 会话 id 过期的场景），失败回退 env 中客户端启动时挂接的会话
+    let tty_target = client_session_by_tty(&socket, shell_pid).await;
+    macro_log::d!("[cwd] 目标会话: tty 匹配={tty_target:?} env 回退={env_target:?}");
+    let target = tty_target.or(env_target);
+    let r = query_tmux_pane_cwd(&socket, target.clone()).await;
+    macro_log::d!("[cwd] pane cwd 查询: socket={socket} target={target:?} -> {r:?}");
+    r
 }
 
 /// 解析 TMUX 环境变量 "socket_path,server_pid,session_id" → (socket, -t 目标)。
@@ -103,6 +123,43 @@ fn parse_tmux_env(env: &str) -> Option<(String, Option<String>)> {
     let session = parts.next()?.trim();
     let target = session.parse::<u64>().ok().map(|n| format!("${n}"));
     Some((socket.to_string(), target))
+}
+
+/// 按控制终端路径匹配 tmux 客户端当前挂接的会话（list-clients）。
+/// TMUX env 的会话 id 仅在客户端启动时写入，switch-client 后过期；
+/// 此处读外层 shell 的 fd/0 符号链接（/dev/pts/N）与 #{client_tty} 比对，以
+/// server 的实时归属为准。返回 tmux 唯一会话 id（"$<n>"，可直接作 -t 目标）。
+#[cfg(unix)]
+async fn client_session_by_tty(socket: &str, shell_pid: u32) -> Option<String> {
+    let tty = std::fs::read_link(format!("/proc/{shell_pid}/fd/0"))
+        .ok()?
+        .to_string_lossy()
+        .into_owned();
+    let mut cmd = tokio::process::Command::new("tmux");
+    cmd.arg("-S")
+        .arg(socket)
+        .arg("list-clients")
+        .arg("-F")
+        .arg("#{client_tty}|#{session_id}");
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::null());
+    let out = tokio::time::timeout(std::time::Duration::from_secs(2), cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find(|l| l.starts_with(&tty) && l[tty.len()..].starts_with('|'))
+        .and_then(|l| l.split_once('|').map(|(_, s)| s.trim().to_string()))
+        .filter(|s| {
+            s.len() > 1
+                && s.starts_with('$')
+                && s[1..].chars().all(|c| c.is_ascii_digit())
+        })
 }
 
 /// 执行 tmux display-message 查询活动 pane 的当前路径（2s 超时，防 tmux server 卡死拖住上传）
@@ -128,12 +185,26 @@ async fn query_tmux_pane_cwd(socket: &str, target: Option<String>) -> Option<Str
     (dir.starts_with('/') && std::path::Path::new(&dir).is_dir()).then_some(dir)
 }
 
-/// 直接子进程列表（/proc/<pid>/task/<pid>/children，空格分隔）
+/// 在全进程表中查找控制终端与 shell 相同的 tmux 客户端。
+/// 不依赖 /proc/<pid>/task/<pid>/children（部分内核未启用 CONFIG_PROC_CHILDREN，
+/// 文件不存在会导致子进程枚举为空），也不要求 tmux 客户端是 shell 的直接子进程
+/// （别名包装/脚本中转同样命中）；tmux server 守护化后无控制终端，被 tty 条件排除
 #[cfg(unix)]
-fn children_of(pid: u32) -> Vec<u32> {
-    std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
-        .map(|s| s.split_whitespace().filter_map(|t| t.parse().ok()).collect())
-        .unwrap_or_default()
+fn find_tmux_client(shell_tty: u64) -> Option<u32> {
+    for entry in std::fs::read_dir("/proc").ok()? {
+        let Ok(entry) = entry else { continue };
+        let Some(pid) = entry.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        // comm 以 tmux 开头（客户端/服务端二进制名均为 tmux；服务端另有 tty 条件排除）
+        if proc_comm(pid).as_deref().map(|c| c.starts_with("tmux")) != Some(true) {
+            continue;
+        }
+        if proc_tty_nr(pid) == Some(shell_tty) {
+            return Some(pid);
+        }
+    }
+    None
 }
 
 #[cfg(unix)]
@@ -196,6 +267,7 @@ mod tests {
     }
 
     // #[tokio::test]
+    #[allow(unused)] // 手动联调实验，默认停用
     async fn test_run() {
         let child = run("conhost", &["--", "cmd"], Some("D:\\"));
         // let child = run("conhost", &["--", "cmd"], None);

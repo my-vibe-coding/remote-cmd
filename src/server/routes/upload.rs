@@ -47,13 +47,16 @@ fn rejected(reason: &str) -> Message {
 /// = 文件落在 shell 当前工作目录）；会话 id 缺失/未知/归属客户端不符、解析失败
 /// 或 Windows 服务端 → 默认 uploads 目录
 async fn upload_dir(state: &AppState, client_id: &str, session: Option<&str>) -> PathBuf {
-    if let Some(session) = session
-        && let Some(pid) = state.pty_pid(session, client_id)
-        && let Some(cwd) = crate::common::cwd::resolve_process_cwd(pid).await
-    {
+    let pid = session.and_then(|s| state.pty_pid(s, client_id));
+    let Some(pid) = pid else {
+        macro_log::d!("[upload] 回退默认目录: session={session:?} 无已登记 pid（会话未登记/已结束/客户端未回传 session）");
+        return state.data_dir.join("uploads");
+    };
+    if let Some(cwd) = crate::common::cwd::resolve_process_cwd(pid).await {
         macro_log::d!("[upload] 落地进程 cwd: pid={pid} dir={cwd}");
         return PathBuf::from(cwd);
     }
+    macro_log::d!("[upload] 回退默认目录: pid={pid} cwd 解析链失败（见 [cwd] 日志）");
     state.data_dir.join("uploads")
 }
 
