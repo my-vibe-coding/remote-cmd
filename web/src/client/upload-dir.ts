@@ -1,22 +1,28 @@
 /**
  * 目录上传引擎：目录收集（webkitdirectory 选择器 / 拖放 entry API 递归）→
+ * 根目录探测（probe：已存在时经 onConflict 询问覆盖合并 / 目录级重命名）→
  * 并发队列（K=3 worker，每文件独立 relay WS）→ 客户端本地桥 → 远端 /api/upload/ws。
  *
  * 协议（与 server/routes/upload.rs 对应，帧经本地桥纯转发）：
- *   init {type:"upload", name, session, rel_path, resume, mkdir}
- *     → {"type":"ready"}   可发送数据
- *     → {"type":"exists"}  断点续传命中（批次重试跳过）
- *     → {"type":"mkdir_ok"} 空目录还原完成
+ *   init {type:"upload", name, session, rel_path, resume, mkdir, probe, auto_rename, overwrite}
+ *     → {"type":"ready"}     可发送数据
+ *     → {"type":"exists"}    断点续传命中（批次重试跳过）
+ *     → {"type":"mkdir_ok", path, name}   目录创建完成（path = 服务端确认绝对路径）
+ *     → {"type":"dir_exists", path}       目录已存在（probe 模式，未创建）
+ *     → {"type":"rejected", reason}
  *   Binary 帧 ×N（64KB 分块，bufferedAmount 背压）
  *   {type:"upload_end"} → {"type":"uploaded", path} / {"type":"rejected", reason}
  *
- * 断点续传为批次级：服务端按会话维护已成功文件清单，重试批次 resume=true 命中即跳过；
- * 单文件中断整文件重传（服务端异常收尾自动清理残留）。
+ * 语义（与 CLI 目录上传对齐）：
+ * - 目录上传 = 合并 + 同名文件覆盖（overwrite=true），冲突时经 onConflict 询问；
+ * - 重命名 = 目录级新建 root_N（不是内部逐文件改名）；
+ * - rel_path 只含目录部分（不含文件名），服务端落地 = cwd/rel_path/name；
+ * - 断点续传为批次级（服务端按会话清单跳过已成功文件）；单文件中断整文件重传。
  */
 
 export interface UploadTask {
   file: File
-  /** 目录相对路径（含所选目录根名，POSIX '/' 分隔，如 "mydir/sub/a.txt"） */
+  /** 目录相对路径（含所选目录根名，POSIX '/' 分隔，如 "mydir/sub/a.txt"）；拖入的单文件无根目录概念 */
   rel: string
 }
 
@@ -38,15 +44,27 @@ export interface BatchStats {
   bytesTotal: number
   bytesSent: number
   running: boolean
+  /** 服务端确认的根目录绝对路径（probe/创建结果，完成后展示） */
+  rootPaths: string[]
 }
 
 export interface DropCollect {
   tasks: UploadTask[]
   /** 空目录（rel 含根名，mkdir 还原用） */
   emptyDirs: string[]
+  /** 来自目录条目的根目录名（用于 probe/冲突询问；拖入的单文件不产生根） */
+  roots: string[]
   /** true = 部分 item 无法转 entry（Safari 等），已按可解析项收集，提示降级 */
   partial: boolean
 }
+
+export interface DirRootConflict {
+  root: string
+  /** 服务端已存在的目录绝对路径 */
+  path: string
+}
+
+export type ConflictChoice = 'overwrite' | 'rename'
 
 // ---------- 能力检测 ----------
 
@@ -67,11 +85,16 @@ export function supportsEntryApi(): boolean {
 // ---------- 收集 ----------
 
 /** 目录选择器：File.webkitRelativePath 即相对路径（含根目录名） */
-export function collectFromInput(files: FileList): UploadTask[] {
-  return Array.from(files).map((f) => ({
-    file: f,
-    rel: (f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name,
-  }))
+export function collectFromInput(files: FileList): DropCollect {
+  const tasks: UploadTask[] = []
+  const roots = new Set<string>()
+  for (const f of Array.from(files)) {
+    const rel = (f as File & { webkitRelativePath?: string }).webkitRelativePath || f.name
+    tasks.push({ file: f, rel })
+    const i = rel.indexOf('/')
+    if (i > 0) roots.add(rel.slice(0, i))
+  }
+  return { tasks, emptyDirs: [], roots: [...roots], partial: false }
 }
 
 /** 拖放 entry 的最小形状（标准 FileSystemEntry 的 webkit 前缀实现） */
@@ -132,10 +155,11 @@ async function walkDir(
   }
 }
 
-/** 拖放收集：目录 entry 递归展开；entry API 不可用的 item 降级计为 partial */
+/** 拖放收集：目录 entry 递归展开并登记根目录；entry API 不可用的 item 降级计为 partial */
 export async function collectFromDrop(dt: DataTransfer): Promise<DropCollect> {
   const tasks: UploadTask[] = []
   const emptyDirs: string[] = []
+  const roots = new Set<string>()
   let partial = false
   const entries: FsEntry[] = []
   for (const it of Array.from(dt.items || [])) {
@@ -148,32 +172,24 @@ export async function collectFromDrop(dt: DataTransfer): Promise<DropCollect> {
   for (const e of entries) {
     if (e.isFile) {
       try {
+        // 拖入的裸文件无根目录概念：不登记 roots、不参与冲突询问
         tasks.push({ file: await entryFile(e), rel: e.fullPath.replace(/^\/+/, '') })
       } catch {
         /* ignore */
       }
     } else if (e.isDirectory) {
+      roots.add(e.fullPath.replace(/^\/+/, ''))
       await walkDir(e, 0, tasks, emptyDirs)
     }
   }
-  return { tasks, emptyDirs, partial }
+  return { tasks, emptyDirs, roots: [...roots], partial }
 }
 
-// ---------- 单文件/单目录上传 ----------
-
-const CHUNK = 64 * 1024
-const BACKPRESSURE = 8 * 1024 * 1024
-const OPEN_TIMEOUT = 15000
-const RESULT_TIMEOUT = 30000
+// ---------- 目录级协议操作 ----------
 
 function relayUrl(alias: string, session: string): string {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws'
   return `${proto}://${location.host}/api/local/upload?alias=${encodeURIComponent(alias)}&session=${encodeURIComponent(session)}`
-}
-
-function splitRel(rel: string): { dir: string; name: string } {
-  const i = rel.lastIndexOf('/')
-  return i < 0 ? { dir: '', name: rel } : { dir: rel.slice(0, i), name: rel.slice(i + 1) }
 }
 
 function openRelay(alias: string, session: string): Promise<WebSocket> {
@@ -183,7 +199,7 @@ function openRelay(alias: string, session: string): Promise<WebSocket> {
     const t = setTimeout(() => {
       ws.close()
       reject(new Error('relay 连接超时'))
-    }, OPEN_TIMEOUT)
+    }, 15000)
     ws.onopen = () => {
       clearTimeout(t)
       resolve(ws)
@@ -195,7 +211,7 @@ function openRelay(alias: string, session: string): Promise<WebSocket> {
   })
 }
 
-/** 等待一条文本应答（onmessage 替换为单发等待；onclose/超时 → 空串） */
+/** 等待一条文本应答（arm 为发送动作；onclose/超时 → 空串） */
 function waitText(ws: WebSocket, timeout: number, arm: () => void): Promise<string> {
   return new Promise((resolve) => {
     let settled = false
@@ -214,17 +230,78 @@ function waitText(ws: WebSocket, timeout: number, arm: () => void): Promise<stri
   })
 }
 
-type UploadTarget = UploadTask | { mkdir: string }
-const isMkdirTask = (t: UploadTarget): t is { mkdir: string } => 'mkdir' in t
+function parseReply(text: string): { type?: string; reason?: string; path?: string; name?: string } | null {
+  try {
+    return JSON.parse(text)
+  } catch {
+    return null
+  }
+}
 
-/**
- * 单文件/单目录上传：'ok' 成功、'exists' 续传跳过、'fail' 失败。
- * resume 用于批次重试（服务端清单命中跳过）；attempt>0 自动启用。
- */
-async function uploadOne(
+export interface DirSetupResult {
+  /** 目录在操作前是否已存在 */
+  existed: boolean
+  /** 服务端确认的目录绝对路径 */
+  path: string
+  /** 实际相对路径（auto_rename 命中时为 root_N 形态） */
+  actualRel: string
+}
+
+/** 目录探测/创建（mkdir 帧协议，见服务端 upload.rs）： */
+async function dirSetup(
   alias: string,
   session: string,
-  target: UploadTarget,
+  relPath: string,
+  opts: { probe?: boolean; autoRename?: boolean },
+): Promise<DirSetupResult> {
+  const ws = await openRelay(alias, session)
+  try {
+    const first = await waitText(ws, 15000, () => {
+      ws.send(
+        JSON.stringify({
+          type: 'upload',
+          name: '',
+          session,
+          rel_path: relPath,
+          mkdir: true,
+          probe: opts.probe === true,
+          auto_rename: opts.autoRename === true,
+        }),
+      )
+    })
+    const v = first ? parseReply(first) : null
+    if (!v) throw new Error('目录操作无应答')
+    if (v.type === 'mkdir_ok') {
+      return { existed: false, path: v.path ?? '', actualRel: v.name ?? relPath }
+    }
+    if (v.type === 'dir_exists') {
+      return { existed: true, path: v.path ?? '', actualRel: relPath }
+    }
+    if (v.type === 'rejected') throw new Error(v.reason ?? '目录操作被拒绝')
+    throw new Error('目录操作应答异常')
+  } finally {
+    try {
+      ws.close()
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+// ---------- 单文件上传 ----------
+
+const CHUNK = 64 * 1024
+const BACKPRESSURE = 8 * 1024 * 1024
+const RESULT_TIMEOUT = 30000
+
+/** 单文件上传：'ok' 成功、'exists' 续传跳过、'fail' 失败 */
+async function uploadFile(
+  alias: string,
+  session: string,
+  file: File,
+  dir: string,
+  name: string,
+  overwrite: boolean,
   resume: boolean,
   onSent: (sent: number) => void,
 ): Promise<'ok' | 'exists' | 'fail'> {
@@ -235,11 +312,7 @@ async function uploadOne(
     return 'fail'
   }
   try {
-    const mkdir = isMkdirTask(target)
-    const { dir, name } = mkdir ? { dir: target.mkdir, name: '' } : splitRel(target.rel)
-
-    // init → ready / exists / mkdir_ok
-    const first = await waitText(ws, OPEN_TIMEOUT, () => {
+    const first = await waitText(ws, 15000, () => {
       ws.send(
         JSON.stringify({
           type: 'upload',
@@ -247,27 +320,16 @@ async function uploadOne(
           session,
           rel_path: dir,
           resume,
-          mkdir,
+          overwrite,
         }),
       )
     })
-    if (!first) return 'fail'
-    let v: { type?: string; reason?: string }
-    try {
-      v = JSON.parse(first)
-    } catch {
-      return 'fail'
-    }
+    const v = first ? parseReply(first) : null
+    if (!v) return 'fail'
     if (v.type === 'exists') return 'exists'
-    if (v.type === 'mkdir_ok') return 'ok'
     if (v.type !== 'ready') return 'fail'
-    if (mkdir) {
-      ws.close()
-      return 'ok'
-    }
 
     // 数据流：64KB 分块 + bufferedAmount 背压（发送侧水位即进度）
-    const file = target.file
     let offset = 0
     while (offset < file.size) {
       if (ws.readyState !== WebSocket.OPEN) return 'fail'
@@ -281,20 +343,11 @@ async function uploadOne(
       onSent(offset)
     }
 
-    // upload_end → uploaded / rejected
     const result = await waitText(ws, RESULT_TIMEOUT, () => {
       ws.send(JSON.stringify({ type: 'upload_end' }))
     })
-    if (result) {
-      try {
-        const rv = JSON.parse(result)
-        if (rv.type === 'uploaded') return 'ok'
-        if (rv.type === 'rejected') return 'fail'
-      } catch {
-        /* ignore */
-      }
-    }
-    return 'fail'
+    const rv = result ? parseReply(result) : null
+    return rv?.type === 'uploaded' ? 'ok' : 'fail'
   } finally {
     try {
       ws.close()
@@ -306,16 +359,28 @@ async function uploadOne(
 
 // ---------- 批次引擎 ----------
 
+type UploadTarget = UploadTask | { mkdir: string }
+const isMkdirTask = (t: UploadTarget): t is { mkdir: string } => 'mkdir' in t
+
 interface QueueItem {
   /** mkdir 伪任务为 -1（不进文件状态表） */
   idx: number
   target: UploadTarget
 }
 
+/** 根目录处理计划（probe + 冲突选择的结果） */
+interface RootPlan {
+  root: string
+  actualRoot: string
+  overwrite: boolean
+  path: string
+}
+
 export class DirUploadEngine {
   private alias: string
   private session: string
   private tasks: UploadTask[]
+  private roots: string[]
   private queue: QueueItem[] = []
   private files: FileState[]
   private cancelled = false
@@ -323,17 +388,28 @@ export class DirUploadEngine {
   private throttle: number | null = null
   private resolveBatch: ((s: BatchStats) => void) | null = null
   private onUpdate: (stats: BatchStats, files: FileState[]) => void
+  /** 目录冲突询问回调（浏览器 UI 实现）；未提供时默认重命名 */
+  private onConflict?: (c: DirRootConflict) => Promise<ConflictChoice>
+  private rootPlans: RootPlan[] = []
+  /** 根目录 rel → actualRoot 的映射（重命名后子路径前缀同步） */
+  private remaps: Array<{ from: string; to: string }> = []
+  rootPaths: string[] = []
 
   constructor(opts: {
     alias: string
     session: string
     tasks: UploadTask[]
     emptyDirs: string[]
+    /** 来自目录条目的根目录名（probe/冲突询问用；拖入的裸文件不在其中） */
+    roots: string[]
     onUpdate: (stats: BatchStats, files: FileState[]) => void
+    onConflict?: (c: DirRootConflict) => Promise<ConflictChoice>
   }) {
     this.alias = opts.alias
     this.session = opts.session
     this.tasks = opts.tasks
+    this.roots = opts.roots
+    this.onConflict = opts.onConflict
     this.onUpdate = opts.onUpdate
     this.files = opts.tasks.map((t) => ({ rel: t.rel, size: t.file.size, sent: 0, status: 'pending' }))
     // 空目录还原排最前，随后文件任务
@@ -361,6 +437,7 @@ export class DirUploadEngine {
       bytesTotal,
       bytesSent,
       running: this.running,
+      rootPaths: this.rootPaths,
     }
   }
 
@@ -370,6 +447,49 @@ export class DirUploadEngine {
       this.throttle = null
       this.onUpdate(this.stats(), this.files.map((f) => ({ ...f })))
     }, 200)
+  }
+
+  /** 根目录 rel → actualRoot 的前缀映射（重命名后子路径同步） */
+  private remap(rel: string): string {
+    for (const m of this.remaps) {
+      if (rel === m.from || rel.startsWith(m.from + '/')) {
+        return m.to + rel.slice(m.from.length)
+      }
+    }
+    return rel
+  }
+
+  /** 每轮批量执行前的准备：逐根目录 probe →（冲突时询问）→ 记录映射 */
+  private async prepare(): Promise<void> {
+    for (const root of this.roots) {
+      try {
+        const probe = await dirSetup(this.alias, this.session, root, { probe: true })
+        if (!probe.existed) {
+          this.rootPlans.push({ root, actualRoot: root, overwrite: false, path: probe.path })
+          continue
+        }
+        let choice: ConflictChoice = 'rename'
+        if (this.onConflict) choice = await this.onConflict({ root, path: probe.path })
+        if (choice === 'overwrite') {
+          this.rootPlans.push({ root, actualRoot: root, overwrite: true, path: probe.path })
+        } else {
+          const created = await dirSetup(this.alias, this.session, root, { autoRename: true })
+          this.rootPlans.push({ root, actualRoot: created.actualRel, overwrite: false, path: created.path })
+          this.remaps.push({ from: root, to: created.actualRel })
+        }
+      } catch (e) {
+        // 探测失败降级：按重命名语义直接上传（不阻塞批次）
+        this.rootPlans.push({ root, actualRoot: root, overwrite: false, path: '' })
+        console.warn(`[upload-dir] 根目录 ${root} 探测失败，按重命名语义继续`, e)
+      }
+    }
+    this.rootPaths = this.rootPlans.map((p) => p.path)
+  }
+
+  /** 目标 rel（已 remap）的覆盖语义：命中根目录计划则跟随，裸文件默认重命名 */
+  private overwriteFor(remappedRel: string): boolean {
+    const plan = this.rootPlans.find((p) => remappedRel === p.actualRoot || remappedRel.startsWith(p.actualRoot + '/'))
+    return plan?.overwrite ?? false
   }
 
   private async worker() {
@@ -386,6 +506,7 @@ export class DirUploadEngine {
       let res: 'ok' | 'exists' | 'fail' = 'fail'
       for (let attempt = 0; attempt < 3 && !this.cancelled; attempt++) {
         if (attempt > 0) await sleep(500 * 2 ** (attempt - 1))
+        const resume = attempt > 0
         const onSent =
           item.idx >= 0
             ? (sent: number) => {
@@ -393,7 +514,27 @@ export class DirUploadEngine {
                 this.notify()
               }
             : () => {}
-        res = await uploadOne(this.alias, this.session, item.target, attempt > 0, onSent)
+        if (isMkdirTask(item.target)) {
+          const dir = this.remap(item.target.mkdir)
+          res = await dirSetup(this.alias, this.session, dir, {})
+            .then(() => 'ok' as const)
+            .catch(() => 'fail' as const)
+        } else {
+          const rel = this.remap(item.target.rel)
+          const i = rel.lastIndexOf('/')
+          const dir = i < 0 ? '' : rel.slice(0, i)
+          const name = rel.slice(i + 1)
+          res = await uploadFile(
+            this.alias,
+            this.session,
+            item.target.file,
+            dir,
+            name,
+            this.overwriteFor(rel),
+            resume,
+            onSent,
+          )
+        }
         if (res !== 'fail') break
       }
       if (item.idx >= 0) {
@@ -414,6 +555,7 @@ export class DirUploadEngine {
     if (this.running) return
     this.running = true
     this.cancelled = false
+    await this.prepare()
     const workers = Array.from({ length: 3 }, () => this.worker())
     await Promise.all(workers)
     this.running = false
