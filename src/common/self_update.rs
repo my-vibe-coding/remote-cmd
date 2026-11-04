@@ -42,6 +42,20 @@ pub fn current_target() -> &'static str {
     }
 }
 
+/// 当前平台的 Release 资产文件名（命名约定 remote-cmd-{tag}-{target}.{后缀}）：
+/// Windows 发布 zip，Linux 发布 tar.gz——资产名、临时文件命名、SHA256SUMS 匹配
+/// 三处必须一致，统一到此避免平台后缀漂移
+fn asset_file_name(tag: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!("remote-cmd-{tag}-{}.zip", current_target())
+    }
+    #[cfg(not(windows))]
+    {
+        format!("remote-cmd-{tag}-{}.tar.gz", current_target())
+    }
+}
+
 // ---------- 代理 ----------
 
 /// Windows 图形界面设置的代理（WinINET 注册表配置）不在环境变量里，需手动读取。
@@ -139,6 +153,8 @@ fn is_newer(latest: &str, current: &str) -> bool {
 struct ReleaseInfo {
     /// 去掉 v 前缀的版本号
     tag: String,
+    /// 当前平台的资产文件名（临时文件命名与 SHA256SUMS 匹配用）
+    asset_name: String,
     /// 匹配当前平台的 zip 下载地址（手动发布的 release 可能没有资产）
     asset_url: Option<String>,
     /// SHA256SUMS 校验文件下载地址（可选）
@@ -163,10 +179,7 @@ async fn fetch_release(client: &reqwest::Client) -> Result<ReleaseInfo> {
     let assets = v["assets"]
         .as_array()
         .ok_or_else(|| anyhow!("GitHub 响应缺少 assets"))?;
-    #[cfg(windows)]
-    let want = format!("remote-cmd-{}-{}.zip", tag, current_target());
-    #[cfg(not(windows))]
-    let want = format!("remote-cmd-{}-{}.tar.gz", tag, current_target());
+    let want = asset_file_name(&tag);
     let mut asset_url = None;
     let mut sums_url = None;
     for a in assets {
@@ -180,6 +193,7 @@ async fn fetch_release(client: &reqwest::Client) -> Result<ReleaseInfo> {
     }
     Ok(ReleaseInfo {
         tag: tag.trim_start_matches('v').to_string(),
+        asset_name: want,
         asset_url,
         sums_url,
     })
@@ -234,44 +248,99 @@ fn sha256_file(path: &PathBuf) -> Result<String> {
 }
 
 /// 从 SHA256SUMS 文本中解析目标文件的期望哈希（行格式 "<hex>  <文件名>"，
-/// 文件名带 tag 前缀，按 "-{target}.zip" 后缀匹配）
-fn expected_hash(sums: &str, target: &str) -> Option<String> {
-    let suffix = format!("-{target}.zip");
+/// 按平台资产名匹配，兼容行内带目录前缀的写法）
+fn expected_hash(sums: &str, asset_name: &str) -> Option<String> {
     sums.lines().find_map(|l| {
         let mut it = l.split_whitespace();
         let hash = it.next()?;
         let name = it.next()?;
-        (name.ends_with(&suffix)).then(|| hash.to_string())
+        (name.ends_with(asset_name)).then(|| hash.to_string())
     })
 }
 
-/// 解压 zip 内的可执行文件到 dest（Windows 取 .exe，其它取非 .exe 主文件）
-fn extract_binary(zip_path: &PathBuf, dest: &PathBuf) -> Result<()> {
-    let f = File::open(zip_path)?;
-    let mut ar = zip::ZipArchive::new(f).context("读取 zip 失败")?;
-    for i in 0..ar.len() {
-        let mut entry = ar.by_index(i)?;
-        if entry.is_dir() {
-            continue;
+/// 解压 Release 资产中的可执行文件到 dest。
+/// Windows 资产为 zip（zip crate 解包）；Linux 资产为 tar.gz——用系统 tar 命令行
+/// 解压（tar/flate2 crate 偏重，且 Linux 服务器恒预装 tar）。tar 成员名不确定，
+/// 解压到临时目录后按文件名挑选二进制（优先含 remote-cmd，其次最大文件）
+fn extract_binary(archive: &PathBuf, dest: &PathBuf) -> Result<()> {
+    #[cfg(windows)]
+    {
+        let f = File::open(archive)?;
+        let mut ar = zip::ZipArchive::new(f).context("读取 zip 失败")?;
+        for i in 0..ar.len() {
+            let mut entry = ar.by_index(i)?;
+            if entry.is_dir() {
+                continue;
+            }
+            let name = entry.name().to_string();
+            if !name.ends_with(".exe") {
+                continue;
+            }
+            let mut out = File::create(dest)?;
+            std::io::copy(&mut entry, &mut out)?;
+            return Ok(());
         }
-        let name = entry.name().to_string();
-        #[cfg(windows)]
-        let is_binary = name.ends_with(".exe");
-        #[cfg(not(windows))]
-        let is_binary = !name.ends_with(".exe");
-        if !is_binary {
-            continue;
+        Err(anyhow!("压缩包内未找到可执行文件"))
+    }
+    #[cfg(not(windows))]
+    {
+        let tmp = tempfile::Builder::new()
+            .prefix("remote-cmd-extract-")
+            .tempdir()
+            .context("创建解压临时目录失败")?;
+        let out = Command::new("tar")
+            .arg("-xzf")
+            .arg(archive)
+            .arg("-C")
+            .arg(tmp.path())
+            .output()
+            .context("执行 tar 解压失败（Linux 需预装 tar 命令）")?;
+        if !out.status.success() {
+            bail!("tar 解压失败: {}", String::from_utf8_lossy(&out.stderr).trim());
         }
-        let mut out = File::create(dest)?;
-        std::io::copy(&mut entry, &mut out)?;
+        let mut files = Vec::new();
+        collect_files(tmp.path(), &mut files, 0);
+        let bin = files
+            .iter()
+            .find(|p| {
+                p.file_name()
+                    .map(|s| s.to_string_lossy().contains("remote-cmd"))
+                    .unwrap_or(false)
+            })
+            .or_else(|| {
+                // 无命名约定文件时取最大文件（二进制体积远大于附带的 README 等）
+                files
+                    .iter()
+                    .max_by_key(|p| fs::metadata(p).map(|m| m.len()).unwrap_or(0))
+            })
+            .ok_or_else(|| anyhow!("压缩包内未找到可执行文件"))?;
+        fs::copy(bin, dest).context("写入新二进制失败")?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(dest, fs::Permissions::from_mode(0o755))?;
         }
-        return Ok(());
+        Ok(())
     }
-    Err(anyhow!("压缩包内未找到可执行文件"))
+}
+
+/// 递归收集目录下文件（限深 4 层，防异常嵌套压缩包）
+#[cfg(not(windows))]
+fn collect_files(dir: &std::path::Path, out: &mut Vec<PathBuf>, depth: usize) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(rd) = fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            collect_files(&p, out, depth + 1);
+        } else {
+            out.push(p);
+        }
+    }
 }
 
 // ---------- 替换自身 ----------
@@ -299,7 +368,7 @@ pub async fn update() -> Result<()> {
     macro_log::i!("发现新版本 v{}，开始下载（当前 v{CURRENT_VERSION}）", rel.tag);
 
     let dir = exe_dir()?;
-    let zip_path = dir.join(format!("remote-cmd-{}.zip.download", current_target()));
+    let zip_path = dir.join(format!("{}.download", rel.asset_name));
     let sums_path = dir.join("SHA256SUMS.download");
 
     // 下载 + 完整性校验
@@ -309,7 +378,7 @@ pub async fn update() -> Result<()> {
         Some(u) => {
             download(&client, u, &sums_path).await?;
             let sums = fs::read_to_string(&sums_path)?;
-            match expected_hash(&sums, current_target()) {
+            match expected_hash(&sums, &rel.asset_name) {
                 Some(h) if h.eq_ignore_ascii_case(&actual) => {}
                 Some(h) => bail!("SHA256 校验失败：期望 {h}，实际 {actual}"),
                 None => bail!("SHA256SUMS 中缺少当前平台的校验项"),
@@ -371,6 +440,25 @@ pub fn self_cleanup(paths: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SHA256SUMS 按资产名匹配：命中本平台项、忽略其它平台、未知资产返回 None
+    #[test]
+    fn expected_hash_matches_asset_name() {
+        let sums = "abc123  remote-cmd-v0.1.7-x86_64-unknown-linux-musl.tar.gz\n\
+                    def456  remote-cmd-v0.1.7-x86_64-pc-windows-msvc.zip\n";
+        assert_eq!(
+            expected_hash(sums, "remote-cmd-v0.1.7-x86_64-unknown-linux-musl.tar.gz"),
+            Some("abc123".to_string())
+        );
+        assert_eq!(
+            expected_hash(sums, "remote-cmd-v0.1.7-x86_64-pc-windows-msvc.zip"),
+            Some("def456".to_string())
+        );
+        assert_eq!(
+            expected_hash(sums, "remote-cmd-v0.1.7-x86_64-unknown-linux-musl.zip"),
+            None
+        );
+    }
 
     /// 无 ESC 前缀的应答残余（ConPTY/crossterm 吞掉 ESC 后逐键到达）应被吞掉
     #[test]
