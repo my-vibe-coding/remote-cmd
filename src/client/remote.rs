@@ -256,6 +256,35 @@ pub async fn ws_exec(
     }
 }
 
+/// 建立裸上传 WS 通道（目录上传浏览器桥用）：连接 /api/upload/ws 并 split。
+/// 业务帧由浏览器侧引擎直接透传（init{name,size,session,rel_path,resume,mkdir}
+/// → ready/exists → Binary×N → upload_end → uploaded/rejected / mkdir_ok），
+/// 本地桥只做通道转发，不解析业务帧。
+pub async fn ws_upload_socket(
+    server_url: &str,
+    token: &str,
+    cert_sha256: Option<&str>,
+) -> Result<(
+    futures::stream::SplitSink<WsStream, WsMessage>,
+    futures::stream::SplitStream<WsStream>,
+)> {
+    let url = server_url
+        .replacen("https://", "wss://", 1)
+        .replacen("http://", "ws://", 1);
+    let mut request = format!("{url}/api/upload/ws").into_client_request()?;
+    request
+        .headers_mut()
+        .insert("X-Client-Token", token.parse().map_err(|_| anyhow::anyhow!("token 含非法字符"))?);
+    let (ws, _) = connect_async_tls_with_config(
+        request,
+        None,
+        false,
+        Some(tls_connector(cert_sha256.and_then(parse_pin), None)),
+    )
+    .await?;
+    Ok(ws.split())
+}
+
 /// 上传单个文件到服务端：独立 WS 连接（复用 exec 的 TLS pin 校验与 X-Client-Token 认证）。
 /// 协议：init 文本帧（name/size/session）→ Binary 数据帧×N（64KB 分块）→ upload_end 文本帧
 /// → 服务端应答 uploaded（含远端绝对路径）/ rejected 文本帧。
@@ -327,6 +356,7 @@ pub async fn ws_upload(
                         let _ = sink.close().await;
                         return Ok(path);
                     }
+                    Some("ready") => {} // 目录上传协议的就绪应答，CLI 单文件流程忽略
                     Some("rejected") => {
                         anyhow::bail!("{}", v["reason"].as_str().unwrap_or("上传被拒绝"));
                     }

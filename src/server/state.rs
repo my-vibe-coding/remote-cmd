@@ -30,6 +30,10 @@ pub struct AppState {
     /// session_id 读取 shell 进程 cwd，使拖放上传落地该会话 shell 的工作目录；
     /// 查询时校验归属客户端，防跨客户端冒用会话 id
     pub pty_pids: Mutex<HashMap<String, PtyPidEntry>>,
+    /// 各会话已成功上传的文件清单（键 = "rel_path/文件名" 归一化）：目录上传的
+    /// 批次级断点续传——重试批次时 init 带 resume=true 命中清单则应答 exists 跳过；
+    /// 会话结束时随 pid 登记一并清理
+    pub upload_manifests: Mutex<HashMap<String, std::collections::HashSet<String>>>,
 }
 
 /// 会话 pid 登记项
@@ -54,6 +58,7 @@ impl AppState {
             global_sem: Arc::new(Semaphore::new(Self::GLOBAL_EXEC_LIMIT)),
             per_client_sem: Mutex::new(HashMap::new()),
             pty_pids: Mutex::new(HashMap::new()),
+            upload_manifests: Mutex::new(HashMap::new()),
         }
     }
 
@@ -102,5 +107,34 @@ impl AppState {
         let pids = self.pty_pids.lock().unwrap();
         let entry = pids.get(session_id)?;
         (entry.client_id == client_id).then_some(entry.pid)
+    }
+
+    /// 目录上传断点续传：文件是否已在会话清单中（session 为空 = 无会话，不启用续传）
+    pub fn upload_done(&self, session: &str, key: &str) -> bool {
+        !session.is_empty()
+            && self
+                .upload_manifests
+                .lock()
+                .unwrap()
+                .get(session)
+                .map(|set| set.contains(key))
+                .unwrap_or(false)
+    }
+
+    /// 登记会话已成功上传的文件（session 为空跳过）
+    pub fn upload_mark(&self, session: &str, key: &str) {
+        if !session.is_empty() {
+            self.upload_manifests
+                .lock()
+                .unwrap()
+                .entry(session.to_string())
+                .or_default()
+                .insert(key.to_string());
+        }
+    }
+
+    /// 会话结束时清理上传清单
+    pub fn clear_uploads(&self, session_id: &str) {
+        self.upload_manifests.lock().unwrap().remove(session_id);
     }
 }

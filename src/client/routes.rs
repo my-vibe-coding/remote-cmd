@@ -29,6 +29,7 @@ pub fn router() -> Router {
         .route("/api/local/script/reveal", post(reveal_script))
         .route("/api/local/exec", post(exec))
         .route("/api/local/exec-pty", get(exec_pty))
+        .route("/api/local/upload", get(upload_relay))
         .route("/api/local/script", post(gen_script))
         .fallback(local_static)
         .with_state(())
@@ -497,25 +498,36 @@ async fn exec_pty_bridge(
     use futures::{SinkExt as _, StreamExt as _};
     use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-    let ExecWs { sink: mut rtx, stream: mut rrx, .. } =
-        match crate::client::run_cmd::ws_exec_recovered(&server, &program, &args, true, tty_size)
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                crate::dlog!("[exec-pty] 远端会话建立失败: {e}");
-                let mut b = browser;
-                let _ = b.send(axum::extract::ws::Message::Text(
-                    serde_json::json!({ "type": "error", "message": format!("建立远端会话失败: {e}") })
-                        .to_string()
-                        .into(),
-                ))
-                .await;
-                let _ = b.close().await;
-                return;
-            }
-        };
+    let ExecWs {
+        sink: mut rtx,
+        stream: mut rrx,
+        session_id,
+    } = match crate::client::run_cmd::ws_exec_recovered(&server, &program, &args, true, tty_size)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            crate::dlog!("[exec-pty] 远端会话建立失败: {e}");
+            let mut b = browser;
+            let _ = b.send(axum::extract::ws::Message::Text(
+                serde_json::json!({ "type": "error", "message": format!("建立远端会话失败: {e}") })
+                    .to_string()
+                    .into(),
+            ))
+            .await;
+            let _ = b.close().await;
+            return;
+        }
+    };
     let (mut btx, mut brx) = browser.split();
+    // 会话 id 下发：目录上传等浏览器功能按此定位远端会话（服务端据 session 解析 shell cwd）
+    let _ = btx
+        .send(axum::extract::ws::Message::Text(
+            serde_json::json!({ "type": "session", "session_id": session_id })
+                .to_string()
+                .into(),
+        ))
+        .await;
     let mut ping = tokio::time::interval(BRIDGE_PING_INTERVAL);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -586,6 +598,109 @@ async fn exec_pty_bridge(
                     break;
                 }
             }
+        }
+    }
+    let _ = btx.close().await;
+    let _ = rtx.close().await;
+}
+
+// ---- 目录上传桥 ----
+
+#[derive(Deserialize)]
+struct UploadRelayQuery {
+    /// 上传目标：与会话同一台服务器（会话 id 按服务器隔离，session 落到别的服务器会失效）
+    alias: String,
+    /// exec 会话 id（exec-pty 桥下发的 session 帧）
+    session: String,
+}
+
+/// 目录上传桥：浏览器 ↔ 本地客户端 ↔ 远端 /api/upload/ws 纯帧管道。
+/// 业务协议由浏览器引擎与服务端约定（init{name,size,session,rel_path,resume,mkdir}
+/// → ready/exists → Binary×N → upload_end → uploaded/rejected / mkdir_ok），
+/// 本地桥只做鉴权来源（token 在客户端）与帧转发，不解析业务帧。
+async fn upload_relay(
+    RawQuery(raw): RawQuery,
+    ws: WebSocketUpgrade,
+) -> Result<Response, (StatusCode, String)> {
+    let q: UploadRelayQuery = serde_html_form::from_str(raw.as_deref().unwrap_or_default())
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("查询参数无效: {e}")))?;
+    let (server, _) = crate::client::run_cmd::resolve_exec_target(&q.alias, &[])
+        .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    Ok(ws.on_upgrade(move |socket| upload_relay_bridge(socket, server)))
+}
+
+/// 双向帧管道：任一侧结束即整桥拆除（浏览器自行管理重试与断点续传）
+async fn upload_relay_bridge(browser: WebSocket, server: ServerReg) {
+    use futures::{SinkExt as _, StreamExt as _};
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    let ws = match crate::client::remote::ws_upload_socket(
+        &server.server_url,
+        server.token.as_deref().unwrap_or_default(),
+        server.cert_sha256.as_deref(),
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            crate::dlog!("[upload-relay] 远端上传通道建立失败: {e}");
+            let mut b = browser;
+            let _ = b.send(axum::extract::ws::Message::Text(
+                serde_json::json!({ "type": "error", "message": format!("建立远端上传通道失败: {e}") })
+                    .to_string()
+                    .into(),
+            ))
+            .await;
+            let _ = b.close().await;
+            return;
+        }
+    };
+    let (mut rtx, mut rrx) = ws;
+    let (mut btx, mut brx) = browser.split();
+    loop {
+        tokio::select! {
+            // 浏览器 → 远端
+            msg = brx.next() => match msg {
+                Some(Ok(axum::extract::ws::Message::Text(t))) => {
+                    if rtx.send(WsMessage::Text(t.as_str().into())).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Ok(axum::extract::ws::Message::Binary(b))) => {
+                    if rtx.send(WsMessage::Binary(b.as_ref().to_vec().into())).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Ok(axum::extract::ws::Message::Close(_))) | None => break,
+                Some(Ok(_)) => {} // Ping/Pong 由底层协议处理
+                Some(Err(e)) => {
+                    crate::dlog!("[upload-relay] 浏览器 WS 错误: {e}");
+                    break;
+                }
+            },
+            // 远端 → 浏览器
+            frame = rrx.next() => match frame {
+                Some(Ok(WsMessage::Text(t))) => {
+                    if btx.send(axum::extract::ws::Message::Text(t.as_str().into())).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Ok(WsMessage::Binary(b))) => {
+                    if btx.send(axum::extract::ws::Message::Binary(b.to_vec().into())).await.is_err() {
+                        break;
+                    }
+                }
+                Some(Ok(WsMessage::Close(_))) => {
+                    let _ = btx.close().await;
+                    break;
+                }
+                Some(Ok(_)) => {}
+                Some(Err(e)) => {
+                    crate::dlog!("[upload-relay] 远端 WS 错误: {e}");
+                    break;
+                }
+                None => break,
+            },
         }
     }
     let _ = btx.close().await;

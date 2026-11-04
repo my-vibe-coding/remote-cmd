@@ -2,6 +2,8 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
 import { ToolPanelManager } from '@develon/webui-panel'
 import ExecPanel from '../components/ExecPanel.vue'
+import DirUploadCard from '../components/DirUploadCard.vue'
+import { supportsDirInput, supportsEntryApi } from '../upload-dir'
 import { ApiError, localApi, type AliasDefInfo, type ServerRegInfo } from '../../shared/api'
 import { consumeSse, decodeBase64Utf8, type ExecOutputPayload } from '../../shared/sse'
 import { nowShort } from '../../shared/utils'
@@ -20,6 +22,8 @@ interface RunSession {
   sysLine: string
   /** 会话是否已落终态（exit / 异常断开）；未落终态时启用关闭页面前确认 */
   done: boolean
+  /** 远端会话 id（exec-pty 桥 session 帧下发）：目录上传据此定位 shell cwd */
+  sessionId?: string
 }
 
 const aliases = ref<Record<string, AliasDefInfo>>({})
@@ -162,6 +166,7 @@ function openPtySession(item: RunSession, size: { cols: number; rows: number }) 
       try {
         const v = JSON.parse(e.data)
         if (v.type === 'exit') finishSession(item, v)
+        else if (v.type === 'session') item.sessionId = v.session_id
         else if (v.type === 'error') {
           panel.termWrite(`\r\n\x1b[31m${v.message ?? '连接失败'}\x1b[0m\r\n`)
           finishSession(item, null)
@@ -200,6 +205,63 @@ function closeRun(id: number) {
   ptySockets.delete(id)
   const i = runs.findIndex((r) => r.id === id)
   if (i >= 0) runs.splice(i, 1) // 面板卸载时组件自清理终端实例
+}
+
+// ---------- 目录上传 ----------
+// 目标会话：最近一个已拿到 session_id 的 PTY 会话（拖放面板则精确指向被拖面板）。
+// 目录选择用 webkitdirectory（事实标准），拖放目录用 entry API 递归；
+// 能力缺失时禁用入口并提示降级方案。
+const dirCard = ref<InstanceType<typeof DirUploadCard> | null>(null)
+const dirInput = ref<HTMLInputElement | null>(null)
+const canDirInput = supportsDirInput()
+const canDropDir = supportsEntryApi()
+
+/** 最近一个可作上传目标的 PTY 会话 */
+const uploadTarget = computed(() => {
+  for (let i = runs.length - 1; i >= 0; i--) {
+    const r = runs[i]
+    if (r.pty && !r.done && r.sessionId) return r
+  }
+  return null
+})
+
+function pickDir() {
+  const t = uploadTarget.value
+  if (!t) {
+    formError.value = '请先建立一个交互终端会话（需服务端与客户端均为新版本）'
+    return
+  }
+  dirInput.value?.click()
+}
+
+function onDirPicked(e: Event) {
+  const input = e.target as HTMLInputElement
+  const t = uploadTarget.value
+  if (!input.files || !t) return
+  formError.value = ''
+  void dirCard.value?.startFromInput(t.alias, t.sessionId!, input.files)
+  input.value = '' // 允许重复选择同一目录
+}
+
+function onPanelDrop(item: RunSession, e: DragEvent) {
+  if (!item.pty || !item.sessionId) {
+    formError.value = '目录上传需要交互终端会话（拖到 PTY 终端面板上）'
+    return
+  }
+  if (!canDropDir) {
+    formError.value = '当前浏览器不支持拖放目录，请使用"上传目录"按钮或升级浏览器'
+    return
+  }
+  if (!e.dataTransfer) return
+  formError.value = ''
+  void dirCard.value?.startFromDrop(item.alias, item.sessionId, e.dataTransfer)
+}
+
+/** 拖入视觉反馈：面板高亮（拖离/落盘后移除） */
+function onPanelDragOver(item: RunSession, e: DragEvent) {
+  if (item.pty && item.sessionId && e.dataTransfer?.types.includes('Files')) {
+    e.dataTransfer.dropEffect = 'copy'
+  }
 }
 
 onMounted(load)
@@ -245,18 +307,37 @@ onBeforeUnmount(() => {
           <input v-model="ptyMode" type="checkbox" /> 交互终端
         </label>
         <button class="btn btn-primary" :disabled="!alias" @click="run">执行</button>
+        <button
+          class="btn"
+          :disabled="!uploadTarget || !canDirInput"
+          :title="canDirInput ? '把目录上传到最近一个交互终端会话的 shell 工作目录' : '当前浏览器不支持目录选择'"
+          @click="pickDir"
+        >
+          上传目录
+        </button>
+        <input
+          ref="dirInput"
+          type="file"
+          webkitdirectory
+          multiple
+          class="hidden-dir-input"
+          @change="onDirPicked"
+        />
       </div>
       <p class="dim tip">
         参数将按空格拆分后传给后端，替换模板中的 <code>{args}</code> 占位符。
         交互终端模式下可实时键入（vim/top 等全屏程序可用），关闭则走只读流式输出。
         每次执行会新开一个输出面板，可同时运行多个命令互不干扰；面板支持拖拽、缩放，最小化后可从底部任务栏恢复。
+        {{ canDirInput ? '目录上传：点击"上传目录"或把文件夹拖到终端面板上，文件将落到远端 shell 当前工作目录（保留目录层级）。' : '' }}
+        {{ canDropDir ? '' : '当前浏览器不支持拖放目录，请使用"上传目录"按钮选择。' }}
       </p>
       <p v-if="formError" class="error-text">{{ formError }}</p>
     </section>
 
     <p v-if="runs.length === 0" class="empty-tip">暂无执行任务，执行命令后此处将弹出输出面板</p>
 
-    <!-- 输出面板：展示与终端状态内聚在 ExecPanel，页面只管连接与生命周期 -->
+    <!-- 输出面板：展示与终端状态内聚在 ExecPanel，页面只管连接与生命周期。
+         目录/文件拖放落在面板上 → 上传到该面板会话的 shell 工作目录 -->
     <ExecPanel
       v-for="run in runs"
       :key="run.id"
@@ -269,8 +350,12 @@ onBeforeUnmount(() => {
       @ready="(size) => openPtySession(run, size)"
       @term-input="(d) => sendPtyInput(run.id, d)"
       @term-resize="(size) => sendPtyResize(run.id, size)"
+      @dragover.prevent="onPanelDragOver(run, $event)"
+      @drop.prevent="onPanelDrop(run, $event)"
       @close="closeRun(run.id)"
     />
+
+    <DirUploadCard ref="dirCard" />
 
     <!-- 底部任务栏：列出所有面板，支持最小化/还原与右键窗口管理 -->
     <ToolPanelManager v-if="runs.length > 0" theme="dark" mode="horizontal" />
@@ -329,5 +414,9 @@ onBeforeUnmount(() => {
 :deep(.exec-panel) {
   width: 660px;
   height: 420px;
+}
+
+.hidden-dir-input {
+  display: none;
 }
 </style>

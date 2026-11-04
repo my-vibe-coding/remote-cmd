@@ -32,10 +32,43 @@ pub async fn upload_ws(
 
 #[derive(Deserialize)]
 struct UploadInit {
+    /// 文件名；mkdir 模式下可为空
+    #[serde(default)]
     name: String,
     /// 发起上传的 exec 会话 id：服务端据此定位该会话 shell 进程 cwd 作为落地目录
     #[serde(default)]
     session: String,
+    /// 目录上传的相对路径（POSIX `/` 分隔，逐段净化防穿越）；单文件上传为空
+    #[serde(default)]
+    rel_path: String,
+    /// 批次级断点续传：true 且会话清单已含该文件 → 应答 exists（浏览器跳过）
+    #[serde(default)]
+    resume: bool,
+    /// 空目录还原：只建目录不收文件，应答 mkdir_ok
+    #[serde(default)]
+    mkdir: bool,
+}
+
+/// 净化目录相对路径：按 `/` 分段，逐段走文件名净化（拒绝 `.`/`..`/控制字符），
+/// 空段折叠；段数 ≤16、总长 ≤512。空串合法（落地在根目录）。非法返回 None。
+fn sanitize_rel_path(raw: &str) -> Option<String> {
+    if raw.is_empty() {
+        return Some(String::new());
+    }
+    let mut comps = Vec::new();
+    for seg in raw.split('/') {
+        if seg.is_empty() {
+            continue; // 折叠 "a//b"、首尾 '/'
+        }
+        if seg.contains('\\') {
+            return None; // 目录段不允许反斜杠（Windows 分隔符混淆，防被净化函数截断成意外段）
+        }
+        comps.push(sanitize_name(seg)?);
+    }
+    if comps.len() > 16 || comps.iter().map(|c| c.len() + 1).sum::<usize>() > 512 {
+        return None;
+    }
+    Some(comps.join("/"))
 }
 
 fn rejected(reason: &str) -> Message {
@@ -83,9 +116,9 @@ async fn session(
         }
     };
 
-    // 文件名净化：仅保留文件名部分，拒绝空/特殊名/控制字符（防路径穿越）
-    let Some(name) = sanitize_name(&init.name) else {
-        let _ = socket.send(rejected("文件名非法")).await;
+    // 目录相对路径净化（目录上传的层级还原；单文件上传为空）
+    let Some(rel) = sanitize_rel_path(&init.rel_path) else {
+        let _ = socket.send(rejected("目录路径非法")).await;
         let _ = socket.close().await;
         return;
     };
@@ -93,8 +126,65 @@ async fn session(
     // 落地目录：Unix 优先取该客户端 exec 会话（shell）进程的 cwd——拖放上传语义
     // 即"文件落在 shell 当前工作目录"；会话 id 无效/读取失败/Windows → 默认 uploads 目录。
     // 同名加 _N 后缀，不覆盖已有文件。
-    let session = (!init.session.is_empty()).then_some(init.session.as_str());
-    let dir = upload_dir(&state, &client.id, session).await;
+    let session_owned = init.session.clone();
+    let session = (!session_owned.is_empty()).then_some(session_owned.as_str());
+    let base = upload_dir(&state, &client.id, session).await;
+    let dir = if rel.is_empty() {
+        base.clone()
+    } else {
+        base.join(&rel)
+    };
+
+    // mkdir 模式：空目录还原，只建目录不收文件
+    if init.mkdir {
+        if rel.is_empty() {
+            let _ = socket.send(rejected("mkdir 缺少目录路径")).await;
+            let _ = socket.close().await;
+            return;
+        }
+        match tokio::fs::create_dir_all(&dir).await {
+            Ok(_) => {
+                macro_log::d!("[upload] 还原空目录 {} (from {} {})", dir.display(), hostname, addr.ip());
+                let _ = socket
+                    .send(Message::Text(
+                        serde_json::json!({ "type": "mkdir_ok", "rel_path": rel }).to_string().into(),
+                    ))
+                    .await;
+                let _ = socket.close().await;
+            }
+            Err(e) => {
+                macro_log::w!("[upload] 创建目录失败 {}: {e}", dir.display());
+                let _ = socket.send(rejected("服务端目录创建失败")).await;
+                let _ = socket.close().await;
+            }
+        }
+        return;
+    }
+
+    // 文件名净化：仅保留文件名部分，拒绝空/特殊名/控制字符（防路径穿越）
+    let Some(name) = sanitize_name(&init.name) else {
+        let _ = socket.send(rejected("文件名非法")).await;
+        let _ = socket.close().await;
+        return;
+    };
+
+    // 批次级断点续传：清单命中 → 应答 exists（浏览器跳过该文件）
+    let manifest_key = if rel.is_empty() {
+        name.clone()
+    } else {
+        format!("{rel}/{name}")
+    };
+    if init.resume && state.upload_done(&session_owned, &manifest_key) {
+        macro_log::d!("[upload] 断点续传命中，跳过 {manifest_key} (from {})", hostname);
+        let _ = socket
+            .send(Message::Text(
+                serde_json::json!({ "type": "exists", "key": manifest_key }).to_string().into(),
+            ))
+            .await;
+        let _ = socket.close().await;
+        return;
+    }
+
     if let Err(e) = tokio::fs::create_dir_all(&dir).await {
         macro_log::w!("[upload] 创建上传目录失败 {}: {e}", dir.display());
         let _ = socket.send(rejected("服务端上传目录创建失败")).await;
@@ -110,6 +200,12 @@ async fn session(
             return;
         }
     };
+    // init 就绪应答：浏览器目录上传引擎据此区分"可发送数据"（ready）与"已存在跳过"（exists）
+    let _ = socket
+        .send(Message::Text(
+            serde_json::json!({ "type": "ready", "key": manifest_key }).to_string().into(),
+        ))
+        .await;
     macro_log::d!("[upload] 开始接收 {} -> {} (from {} {})", name, dest.display(), hostname, addr.ip());
 
     // 数据泵：Binary 帧 → 落盘；upload_end 文本帧 → 正常收尾
@@ -158,6 +254,7 @@ async fn session(
     }
 
     let path = display_path(&dest);
+    state.upload_mark(&session_owned, &manifest_key);
     state.audit.log(
         "file.upload",
         &hostname,
@@ -245,6 +342,29 @@ fn display_path(p: &std::path::Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 目录相对路径净化：空串合法（根目录）、空段折叠、`..`/`.`/控制字符拒绝、
+    /// 段数与总长上限
+    #[test]
+    fn sanitize_rel_path_cases() {
+        assert_eq!(sanitize_rel_path(""), Some(String::new()));
+        assert_eq!(sanitize_rel_path("docs/sub"), Some("docs/sub".into()));
+        // 首尾 '/' 与空段折叠
+        assert_eq!(sanitize_rel_path("/docs//sub/"), Some("docs/sub".into()));
+        // 防穿越：.. 与 . 整段拒绝
+        assert_eq!(sanitize_rel_path("../etc"), None);
+        assert_eq!(sanitize_rel_path("docs/../../etc"), None);
+        assert_eq!(sanitize_rel_path("docs/./sub"), None);
+        assert_eq!(sanitize_rel_path("docs/.."), None);
+        // 段级文件名净化：路径分隔与控制字符拒绝
+        assert_eq!(sanitize_rel_path("a\\b"), None);
+        assert_eq!(sanitize_rel_path("a\u{0}b/c"), None);
+        // 段数上限 16
+        let ok16 = (0..16).map(|i| i.to_string()).collect::<Vec<_>>().join("/");
+        assert!(sanitize_rel_path(&ok16).is_some());
+        let over16 = (0..17).map(|i| i.to_string()).collect::<Vec<_>>().join("/");
+        assert_eq!(sanitize_rel_path(&over16), None);
+    }
 
     #[test]
     fn sanitize_name_strips_path_components() {

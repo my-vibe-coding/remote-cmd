@@ -246,6 +246,7 @@ async fn session(mut socket: WebSocket, state: Arc<AppState>, client: crate::ser
     // downlink 完成审计/历史写入后自然退出（原先直接 abort 下行会丢断连会话的 exec.finish）。
     drop(stdin_tx);
     state.clear_pty_pid(&session_id); // 移除会话 pid 登记，防 pid 复用导致 cwd 误读
+    state.clear_uploads(&session_id); // 清理目录上传断点续传清单
     let _ = kill_tx.send(true);
     macro_log::d!("[ws] 已触发会话终止信号，等待下行收尾: {}", program);
     // 兜底：执行器各退出路径均会发送 Exit；限时等待防止许可被意外长期占用
