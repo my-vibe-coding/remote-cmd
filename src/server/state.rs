@@ -34,6 +34,10 @@ pub struct AppState {
     /// 批次级断点续传——重试批次时 init 带 resume=true 命中清单则应答 exists 跳过；
     /// 会话结束时随 pid 登记一并清理
     pub upload_manifests: Mutex<HashMap<String, std::collections::HashSet<String>>>,
+    /// 各会话钉定的上传基准目录（服务端首次解析 cwd 时记录的规范绝对路径）：
+    /// 后续 init 的 base_dir 必须与之严格相等，防客户端伪造任意绝对路径写入
+    /// （上传通道不得成为独立于 shell 的任意写原语）
+    pub upload_bases: Mutex<HashMap<String, String>>,
 }
 
 /// 会话 pid 登记项
@@ -59,6 +63,7 @@ impl AppState {
             per_client_sem: Mutex::new(HashMap::new()),
             pty_pids: Mutex::new(HashMap::new()),
             upload_manifests: Mutex::new(HashMap::new()),
+            upload_bases: Mutex::new(HashMap::new()),
         }
     }
 
@@ -136,5 +141,23 @@ impl AppState {
     /// 会话结束时清理上传清单
     pub fn clear_uploads(&self, session_id: &str) {
         self.upload_manifests.lock().unwrap().remove(session_id);
+        self.upload_bases.lock().unwrap().remove(session_id);
+    }
+
+    /// 记录/刷新会话钉定的上传基准目录：每次**无 base_dir** 的服务端解析都会覆盖刷新
+    /// （即每个目录批次开始时重新解析 shell 当前 cwd，批次间 cd 不受旧钉定影响）；
+    /// 值始终由服务端选出，客户端仅可回声、不可指定
+    pub fn set_upload_base(&self, session_id: &str, base: &str) {
+        if !session_id.is_empty() {
+            self.upload_bases
+                .lock()
+                .unwrap()
+                .insert(session_id.to_string(), base.to_string());
+        }
+    }
+
+    /// 读取会话钉定的基准目录（None = 尚未钉定）
+    pub fn upload_base(&self, session_id: &str) -> Option<String> {
+        self.upload_bases.lock().unwrap().get(session_id).cloned()
     }
 }

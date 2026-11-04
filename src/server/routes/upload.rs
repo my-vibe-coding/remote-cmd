@@ -138,27 +138,46 @@ async fn session(
         return;
     };
 
-    // 落地基准目录：客户端钉定的 base_dir（批次内固定，防 shell cd 导致文件漂移）
-    // 或逐请求解析（Unix 优先会话 shell cwd / tmux 感知，Windows → uploads 目录）
+    // 落地基准目录：base_dir 只能是服务端首次解析并钉定的值（会话内严格相等校验，
+    // 客户端仅可回声、不可伪造任意绝对路径——上传通道不得成为独立于 shell 的任意写原语）；
+    // 未携带 base_dir 时逐请求解析（Unix 优先会话 shell cwd / tmux 感知，Windows → uploads）
     let session_owned = init.session.clone();
     let session = (!session_owned.is_empty()).then_some(session_owned.as_str());
     let base = if !init.base_dir.is_empty() {
-        let bd = PathBuf::from(&init.base_dir);
-        if bd.is_absolute() || init.base_dir.starts_with('/') {
-            macro_log::d!("[upload] 钉定批次基准目录: {}", init.base_dir);
-            bd
-        } else {
-            macro_log::w!("[upload] base_dir 非绝对路径已忽略: {}", init.base_dir);
-            upload_dir(&state, &client.id, session).await
+        let pinned = session.and_then(|s| state.upload_base(s));
+        let valid = pinned.as_deref() == Some(init.base_dir.as_str())
+            && (PathBuf::from(&init.base_dir).is_absolute() || init.base_dir.starts_with('/'));
+        if !valid {
+            macro_log::w!(
+                "[upload] base_dir 与会话钉定值不符，拒绝（可能为伪造请求）: {} (session={:?})",
+                init.base_dir,
+                session
+            );
+            state.audit.log(
+                "file.upload.reject",
+                &hostname,
+                Some(serde_json::json!({ "reason": "base_dir_mismatch", "base_dir": init.base_dir, "ip": addr.ip().to_string() })),
+            );
+            let _ = socket.send(rejected("base_dir 无效（与会话钉定基准不符）")).await;
+            let _ = socket.close().await;
+            return;
         }
+        PathBuf::from(&init.base_dir)
     } else {
-        upload_dir(&state, &client.id, session).await
+        let b = upload_dir(&state, &client.id, session).await;
+        // 首次解析：钉定会话基准（客户端后续回传此值才被接受）
+        state.set_upload_base(&session_owned, &display_path(&b));
+        b
     };
     let dir = if rel.is_empty() {
         base.clone()
     } else {
         base.join(&rel)
     };
+    // 应答的 base 统一取钉定值（客户端回声校验的对象；避免创建前后 canonicalize 差异）
+    let base_display = state
+        .upload_base(&session_owned)
+        .unwrap_or_else(|| display_path(&base));
 
     // mkdir 模式：空目录还原 / 根目录探测（probe、auto_rename），只建目录不收文件
     if init.mkdir {
@@ -175,7 +194,7 @@ async fn session(
                     serde_json::json!({
                         "type": "dir_exists",
                         "path": display_path(&dir),
-                        "base": display_path(&base),
+                        "base": base_display,
                     })
                     .to_string()
                     .into(),
@@ -208,7 +227,7 @@ async fn session(
                             "path": display_path(&target),
                             "name": actual_rel,
                             "existed": existed,
-                            "base": display_path(&base),
+                            "base": base_display,
                         })
                         .to_string()
                         .into(),
