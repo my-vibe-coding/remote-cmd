@@ -44,9 +44,19 @@ struct UploadInit {
     /// 批次级断点续传：true 且会话清单已含该文件 → 应答 exists（浏览器跳过）
     #[serde(default)]
     resume: bool,
-    /// 空目录还原：只建目录不收文件，应答 mkdir_ok
+    /// 空目录还原：只建目录不收文件，应答 mkdir_ok / dir_exists（probe 模式）
     #[serde(default)]
     mkdir: bool,
+    /// mkdir 模式子选项：目录已存在时仅探测不创建，应答 dir_exists
+    #[serde(default)]
+    probe: bool,
+    /// mkdir 模式子选项：目录已存在时自动改名为 root_N 创建（应答带实际 rel 名）
+    #[serde(default)]
+    auto_rename: bool,
+    /// 文件冲突语义：true = 同名文件覆盖写（目录上传合并语义）；
+    /// false = 同名自动 _N 重命名（单文件上传默认）
+    #[serde(default)]
+    overwrite: bool,
 }
 
 /// 净化目录相对路径：按 `/` 分段，逐段走文件名净化（拒绝 `.`/`..`/控制字符），
@@ -135,25 +145,59 @@ async fn session(
         base.join(&rel)
     };
 
-    // mkdir 模式：空目录还原，只建目录不收文件
+    // mkdir 模式：空目录还原 / 根目录探测（probe、auto_rename），只建目录不收文件
     if init.mkdir {
         if rel.is_empty() {
             let _ = socket.send(rejected("mkdir 缺少目录路径")).await;
             let _ = socket.close().await;
             return;
         }
-        match tokio::fs::create_dir_all(&dir).await {
+        let existed = tokio::fs::try_exists(&dir).await.unwrap_or(false);
+        // probe 模式：已存在则仅应答不创建（客户端据此决定覆盖合并或重命名）
+        if init.probe && existed {
+            let _ = socket
+                .send(Message::Text(
+                    serde_json::json!({ "type": "dir_exists", "path": display_path(&dir) })
+                        .to_string()
+                        .into(),
+                ))
+                .await;
+            let _ = socket.close().await;
+            return;
+        }
+        // auto_rename 模式：已存在时自动改名为 root_N（目录级重命名 = 新建另一个目录，
+        // 而非把内部每个重名文件改名）
+        let mut actual_rel = rel.clone();
+        if init.auto_rename && existed {
+            let mut i = 1u32;
+            loop {
+                actual_rel = format!("{rel}_{i}");
+                if !tokio::fs::try_exists(base.join(&actual_rel)).await.unwrap_or(false) {
+                    break;
+                }
+                i += 1;
+            }
+        }
+        let target = if actual_rel == rel { dir.clone() } else { base.join(&actual_rel) };
+        match tokio::fs::create_dir_all(&target).await {
             Ok(_) => {
-                macro_log::d!("[upload] 还原空目录 {} (from {} {})", dir.display(), hostname, addr.ip());
+                macro_log::d!("[upload] 目录就绪 {} (from {} {})", target.display(), hostname, addr.ip());
                 let _ = socket
                     .send(Message::Text(
-                        serde_json::json!({ "type": "mkdir_ok", "rel_path": rel }).to_string().into(),
+                        serde_json::json!({
+                            "type": "mkdir_ok",
+                            "path": display_path(&target),
+                            "name": actual_rel,
+                            "existed": existed,
+                        })
+                        .to_string()
+                        .into(),
                     ))
                     .await;
                 let _ = socket.close().await;
             }
             Err(e) => {
-                macro_log::w!("[upload] 创建目录失败 {}: {e}", dir.display());
+                macro_log::w!("[upload] 创建目录失败 {}: {e}", target.display());
                 let _ = socket.send(rejected("服务端目录创建失败")).await;
                 let _ = socket.close().await;
             }
@@ -191,13 +235,34 @@ async fn session(
         let _ = socket.close().await;
         return;
     }
-    let (dest, mut file) = match open_unique_file(&dir, &name).await {
-        Ok(v) => v,
-        Err(e) => {
-            macro_log::w!("[upload] 创建文件失败 {}/{}: {e}", dir.display(), name);
-            let _ = socket.send(rejected("服务端文件写入失败")).await;
-            let _ = socket.close().await;
-            return;
+    // 文件创建：overwrite（目录合并语义，同名覆盖写）或 _N 重命名（单文件默认）
+    let (dest, mut file) = if init.overwrite {
+        let dest = dir.join(&name);
+        let f = match tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&dest)
+            .await
+        {
+            Ok(f) => f,
+            Err(e) => {
+                macro_log::w!("[upload] 创建文件失败 {}/{}: {e}", dir.display(), name);
+                let _ = socket.send(rejected("服务端文件写入失败")).await;
+                let _ = socket.close().await;
+                return;
+            }
+        };
+        (dest, f)
+    } else {
+        match open_unique_file(&dir, &name).await {
+            Ok(v) => v,
+            Err(e) => {
+                macro_log::w!("[upload] 创建文件失败 {}/{}: {e}", dir.display(), name);
+                let _ = socket.send(rejected("服务端文件写入失败")).await;
+                let _ = socket.close().await;
+                return;
+            }
         }
     };
     // init 就绪应答：浏览器目录上传引擎据此区分"可发送数据"（ready）与"已存在跳过"（exists）

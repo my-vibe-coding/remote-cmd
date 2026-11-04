@@ -8,7 +8,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use super::config::{load_aliases, render_template, ClientConfig, ServerReg};
 use super::remote::{
-    parse_frame, register, resize_msg, trace_frame, ws_exec, ws_mkdir, ws_upload, ExecFrame,
+    parse_frame, register, resize_msg, trace_frame, ws_dir_setup, ws_exec, ws_upload, ExecFrame,
     ExecWs, STDIN_CLOSE,
 };
 use crate::common::fingerprint::MachineInfo;
@@ -299,7 +299,7 @@ async fn run_pty_session(
                                     let size = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
                                     let res = match tokio::fs::File::open(f).await {
                                         Ok(mut file) => {
-                                            ws_upload(&upload_url, &upload_token, &name, size, &mut file, &upload_session, "", upload_cert.as_deref())
+                                            ws_upload(&upload_url, &upload_token, &name, size, &mut file, &upload_session, "", false, upload_cert.as_deref())
                                                 .await
                                         }
                                         Err(e) => Err(anyhow!("本地文件打开失败: {e}")),
@@ -659,8 +659,39 @@ fn collect_dir_tree(root: &std::path::Path) -> anyhow::Result<DirTree> {
     Ok(tree)
 }
 
-/// 目录上传执行：mkdir 还原空目录 → 逐文件带 rel_path 上传。
-/// 返回远端目录路径（任一文件成功时，取落地文件的父目录——_N 重命名只影响文件名）
+/// Windows 冲突询问弹窗：Some(true)=覆盖、Some(false)=重命名。其它平台无原生对话框
+/// 机制 → None（调用方使用默认值"重命名"）。基于既有 windows-sys 依赖的 MessageBoxW，
+/// 不引入新的对话框 crate
+#[cfg(windows)]
+fn ask_overwrite_dialog(rel_root: &str) -> Option<bool> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, IDYES, MB_ICONQUESTION, MB_SETFOREGROUND, MB_YESNO,
+    };
+    let text = format!(
+        "服务器上已存在目录「{rel_root}」。\n\n是 = 覆盖合并（同名文件覆盖，其余保留）\n否 = 重命名为新目录（原目录不动）"
+    );
+    let text_w: Vec<u16> = text.encode_utf16().chain([0]).collect();
+    let title_w: Vec<u16> = "目录上传".encode_utf16().chain([0]).collect();
+    let r = unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text_w.as_ptr(),
+            title_w.as_ptr(),
+            MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND,
+        )
+    };
+    Some(r == IDYES)
+}
+
+/// 非 Windows：无统一原生对话框，默认重命名
+#[cfg(not(windows))]
+fn ask_overwrite_dialog(_rel_root: &str) -> Option<bool> {
+    None
+}
+
+/// 目录上传执行：探测根目录 →（已存在时 Windows 弹窗选择覆盖/重命名，其它平台默认
+/// 重命名）→ mkdir 还原空目录 → 逐文件上传（覆盖语义随用户选择）。
+/// 返回远端目录绝对路径（服务端确认值，非从文件路径推导）
 async fn upload_dir_tree(
     server_url: &str,
     token: &str,
@@ -668,35 +699,74 @@ async fn upload_dir_tree(
     cert: Option<&str>,
     tree: &DirTree,
 ) -> Option<String> {
+    let root_rel = tree.root_name.clone();
+
+    // 1. 探测根目录是否已存在
+    let probe = match ws_dir_setup(server_url, token, session, &root_rel, true, false, cert).await {
+        Ok(p) => p,
+        Err(e) => {
+            crate::dlog!("[upload] 目录 {root_rel} 探测失败: {e:#}");
+            return None;
+        }
+    };
+    // 2. 冲突处理：Windows 弹窗询问覆盖/重命名；其它平台默认重命名
+    let (rel, overwrite, dir_path) = if probe.existed {
+        match ask_overwrite_dialog(&root_rel) {
+            Some(true) => {
+                // 覆盖合并：沿用原目录，同名文件覆盖写
+                (root_rel.clone(), true, probe.path.clone())
+            }
+            choice => {
+                // 重命名：自动改名为 root_N 新建目录（内部无冲突）
+                let created = match ws_dir_setup(server_url, token, session, &root_rel, false, true, cert).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        crate::dlog!("[upload] 目录 {root_rel} 重命名创建失败: {e:#}");
+                        return None;
+                    }
+                };
+                crate::dlog!("[upload] 目录冲突（选择 {}），重命名为 {}", if choice == Some(false) { "重命名" } else { "默认重命名" }, created.actual_rel);
+                (created.actual_rel.clone(), false, created.path.clone())
+            }
+        }
+    } else {
+        (root_rel.clone(), false, probe.path.clone())
+    };
+
+    // 3. mkdir 还原空目录（根目录改名时同步映射前缀）
     for d in &tree.empty_dirs {
-        if let Err(e) = ws_mkdir(server_url, token, session, d, cert).await {
+        let d = remap_root(d, &tree.root_name, &rel);
+        if let Err(e) = ws_dir_setup(server_url, token, session, &d, false, false, cert).await {
             crate::dlog!("[upload] 空目录 {d} 还原失败: {e:#}");
         }
     }
-    let mut first_dir: Option<String> = None;
+
+    // 4. 逐文件上传（rel 同步映射；覆盖语义随用户选择）。
+    // 注意：rel_path 只含目录部分（不含文件名）——服务端落地 = cwd/rel_path/name，
+    // 完整 rel 会多拼一层同名目录
     let mut ok = 0usize;
     let mut fail = 0usize;
-    for (path, rel) in &tree.files {
+    for (path, file_rel) in &tree.files {
+        let frel = remap_root(file_rel, &tree.root_name, &rel);
+        let fdir = match frel.rsplit_once('/') {
+            Some((d, _)) => d,
+            None => "", // 根目录直下的文件
+        };
         let name = path
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
         let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         let res = match tokio::fs::File::open(path).await {
-            Ok(mut file) => ws_upload(server_url, token, &name, size, &mut file, session, rel, cert).await,
+            Ok(mut file) => {
+                ws_upload(server_url, token, &name, size, &mut file, session, fdir, overwrite, cert).await
+            }
             Err(e) => Err(anyhow!("本地文件打开失败: {e}")),
         };
         match res {
-            Ok(p) => {
-                ok += 1;
-                if first_dir.is_none() {
-                    first_dir = std::path::Path::new(&p)
-                        .parent()
-                        .map(|d| d.to_string_lossy().into_owned());
-                }
-            }
+            Ok(_) => ok += 1,
             Err(e) => {
-                crate::dlog!("[upload] {rel} 上传失败: {e:#}");
+                crate::dlog!("[upload] {frel} 上传失败: {e:#}");
                 fail += 1;
             }
         }
@@ -706,7 +776,22 @@ async fn upload_dir_tree(
         tree.root_name,
         tree.skipped
     );
-    first_dir
+    if ok == 0 && !tree.files.is_empty() {
+        return None; // 全部文件失败视为整体失败（回退原文透传）
+    }
+    Some(dir_path)
+}
+
+/// rel 路径的根名映射：root 改名（root → root_N）时同步子路径前缀
+fn remap_root(rel: &str, old_root: &str, new_root: &str) -> String {
+    if old_root == new_root {
+        return rel.to_string();
+    }
+    if let Some(rest) = rel.strip_prefix(old_root) {
+        format!("{new_root}{rest}")
+    } else {
+        rel.to_string()
+    }
 }
 
 /// raw mode 兜底恢复：正常返回路径经 Drop 关闭；process::exit 路径需在此之前手动关闭。

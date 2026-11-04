@@ -285,21 +285,36 @@ pub async fn ws_upload_socket(
     Ok(ws.split())
 }
 
-/// 在会话落地目录下创建空目录（mkdir 语义，协议见服务端 upload.rs）。
-/// rel_path 为 POSIX 分隔的相对路径（服务端逐段净化防穿越；含拖入目录的根名）
-pub async fn ws_mkdir(
+/// 目录探测/创建结果
+pub struct DirProbe {
+    /// 目录在操作前是否已存在
+    pub existed: bool,
+    /// 服务端确认的目录绝对路径
+    pub path: String,
+    /// 实际相对路径（auto_rename 命中时为 root_N 形态）
+    pub actual_rel: String,
+}
+
+/// 目录探测/创建（协议见服务端 upload.rs mkdir 分支）：
+/// - probe=true 且目录已存在 → 不创建，应答 dir_exists
+/// - auto_rename=true 且目录已存在 → 自动改名 root_N 创建
+/// 目录路径为 POSIX 分隔的相对路径（服务端逐段净化防穿越；含拖入目录的根名）
+pub async fn ws_dir_setup(
     server_url: &str,
     token: &str,
     session: &str,
     rel_path: &str,
+    probe: bool,
+    auto_rename: bool,
     cert_sha256: Option<&str>,
-) -> Result<()> {
+) -> Result<DirProbe> {
     if rel_path.is_empty() {
         anyhow::bail!("目录路径为空");
     }
     let (mut sink, mut stream) = ws_upload_socket(server_url, token, cert_sha256).await?;
     let init = serde_json::json!({
-        "type": "upload", "name": "", "session": session, "rel_path": rel_path, "mkdir": true
+        "type": "upload", "name": "", "session": session,
+        "rel_path": rel_path, "mkdir": true, "probe": probe, "auto_rename": auto_rename
     });
     sink.send(WsMessage::Text(init.to_string().into())).await?;
     loop {
@@ -308,8 +323,22 @@ pub async fn ws_mkdir(
                 let v: Value = serde_json::from_str(&t)?;
                 match v["type"].as_str() {
                     Some("mkdir_ok") => {
+                        let path = v["path"].as_str().unwrap_or_default().to_string();
+                        let actual_rel = v["name"].as_str().unwrap_or(rel_path).to_string();
+                        let existed = v["existed"].as_bool().unwrap_or(false);
                         let _ = sink.close().await;
-                        return Ok(());
+                        if path.is_empty() {
+                            anyhow::bail!("服务端未返回目录路径");
+                        }
+                        return Ok(DirProbe { existed, path, actual_rel });
+                    }
+                    Some("dir_exists") => {
+                        let path = v["path"].as_str().unwrap_or_default().to_string();
+                        let _ = sink.close().await;
+                        if path.is_empty() {
+                            anyhow::bail!("服务端未返回目录路径");
+                        }
+                        return Ok(DirProbe { existed: true, path, actual_rel: rel_path.to_string() });
                     }
                     Some("ready") => {}
                     Some("rejected") => {
@@ -340,6 +369,7 @@ pub async fn ws_upload(
     file: &mut tokio::fs::File,
     session_id: &str,
     rel_path: &str,
+    overwrite: bool,
     cert_sha256: Option<&str>,
 ) -> Result<String> {
     use tokio::io::AsyncReadExt as _;
@@ -372,8 +402,9 @@ pub async fn ws_upload(
     let (mut sink, mut stream) = ws.split();
 
     // session_id：服务端据此定位发起上传的 exec 会话 shell 进程 cwd（落地工作目录）；
-    // rel_path：目录上传的相对路径（POSIX 分隔，服务端逐段净化），单文件上传为空
-    let init = serde_json::json!({ "type": "upload", "name": name, "size": size, "session": session_id, "rel_path": rel_path });
+    // rel_path：目录上传的相对路径（POSIX 分隔，服务端逐段净化），单文件上传为空；
+    // overwrite：同名覆盖写（目录合并语义）/ false 时 _N 重命名（单文件默认）
+    let init = serde_json::json!({ "type": "upload", "name": name, "size": size, "session": session_id, "rel_path": rel_path, "overwrite": overwrite });
     sink.send(WsMessage::Text(init.to_string().into())).await?;
 
     let mut buf = vec![0u8; 64 * 1024];
