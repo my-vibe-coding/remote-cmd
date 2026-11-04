@@ -57,6 +57,11 @@ struct UploadInit {
     /// false = 同名自动 _N 重命名（单文件上传默认）
     #[serde(default)]
     overwrite: bool,
+    /// 目录批次的钉定基准目录（绝对路径）：批次开始时由首次探测应答的 base 回传，
+    /// 整批固定落盘位置——避免 shell 上传期间 cd 导致文件漂移，也免去逐文件重跑
+    /// cwd 解析链。空 = 逐请求解析（旧行为）
+    #[serde(default)]
+    base_dir: String,
 }
 
 /// 净化目录相对路径：按 `/` 分段，逐段走文件名净化（拒绝 `.`/`..`/控制字符），
@@ -133,12 +138,22 @@ async fn session(
         return;
     };
 
-    // 落地目录：Unix 优先取该客户端 exec 会话（shell）进程的 cwd——拖放上传语义
-    // 即"文件落在 shell 当前工作目录"；会话 id 无效/读取失败/Windows → 默认 uploads 目录。
-    // 同名加 _N 后缀，不覆盖已有文件。
+    // 落地基准目录：客户端钉定的 base_dir（批次内固定，防 shell cd 导致文件漂移）
+    // 或逐请求解析（Unix 优先会话 shell cwd / tmux 感知，Windows → uploads 目录）
     let session_owned = init.session.clone();
     let session = (!session_owned.is_empty()).then_some(session_owned.as_str());
-    let base = upload_dir(&state, &client.id, session).await;
+    let base = if !init.base_dir.is_empty() {
+        let bd = PathBuf::from(&init.base_dir);
+        if bd.is_absolute() || init.base_dir.starts_with('/') {
+            macro_log::d!("[upload] 钉定批次基准目录: {}", init.base_dir);
+            bd
+        } else {
+            macro_log::w!("[upload] base_dir 非绝对路径已忽略: {}", init.base_dir);
+            upload_dir(&state, &client.id, session).await
+        }
+    } else {
+        upload_dir(&state, &client.id, session).await
+    };
     let dir = if rel.is_empty() {
         base.clone()
     } else {
@@ -157,9 +172,13 @@ async fn session(
         if init.probe && existed {
             let _ = socket
                 .send(Message::Text(
-                    serde_json::json!({ "type": "dir_exists", "path": display_path(&dir) })
-                        .to_string()
-                        .into(),
+                    serde_json::json!({
+                        "type": "dir_exists",
+                        "path": display_path(&dir),
+                        "base": display_path(&base),
+                    })
+                    .to_string()
+                    .into(),
                 ))
                 .await;
             let _ = socket.close().await;
@@ -189,6 +208,7 @@ async fn session(
                             "path": display_path(&target),
                             "name": actual_rel,
                             "existed": existed,
+                            "base": display_path(&base),
                         })
                         .to_string()
                         .into(),

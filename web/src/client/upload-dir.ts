@@ -230,7 +230,9 @@ function waitText(ws: WebSocket, timeout: number, arm: () => void): Promise<stri
   })
 }
 
-function parseReply(text: string): { type?: string; reason?: string; path?: string; name?: string } | null {
+function parseReply(
+  text: string,
+): { type?: string; reason?: string; path?: string; name?: string; base?: string } | null {
   try {
     return JSON.parse(text)
   } catch {
@@ -245,6 +247,8 @@ export interface DirSetupResult {
   path: string
   /** 实际相对路径（auto_rename 命中时为 root_N 形态） */
   actualRel: string
+  /** 服务端解析的基准目录（cwd/uploads）：批次钉定用，后续请求回传 base_dir */
+  base: string
 }
 
 /** 目录探测/创建（mkdir 帧协议，见服务端 upload.rs）： */
@@ -252,6 +256,7 @@ async function dirSetup(
   alias: string,
   session: string,
   relPath: string,
+  baseDir: string,
   opts: { probe?: boolean; autoRename?: boolean },
 ): Promise<DirSetupResult> {
   const ws = await openRelay(alias, session)
@@ -266,16 +271,17 @@ async function dirSetup(
           mkdir: true,
           probe: opts.probe === true,
           auto_rename: opts.autoRename === true,
+          base_dir: baseDir,
         }),
       )
     })
     const v = first ? parseReply(first) : null
     if (!v) throw new Error('目录操作无应答')
     if (v.type === 'mkdir_ok') {
-      return { existed: false, path: v.path ?? '', actualRel: v.name ?? relPath }
+      return { existed: false, path: v.path ?? '', actualRel: v.name ?? relPath, base: v.base ?? '' }
     }
     if (v.type === 'dir_exists') {
-      return { existed: true, path: v.path ?? '', actualRel: relPath }
+      return { existed: true, path: v.path ?? '', actualRel: relPath, base: v.base ?? '' }
     }
     if (v.type === 'rejected') throw new Error(v.reason ?? '目录操作被拒绝')
     throw new Error('目录操作应答异常')
@@ -303,6 +309,7 @@ async function uploadFile(
   name: string,
   overwrite: boolean,
   resume: boolean,
+  baseDir: string,
   onSent: (sent: number) => void,
 ): Promise<'ok' | 'exists' | 'fail'> {
   let ws: WebSocket
@@ -321,6 +328,7 @@ async function uploadFile(
           rel_path: dir,
           resume,
           overwrite,
+          base_dir: baseDir,
         }),
       )
     })
@@ -393,6 +401,8 @@ export class DirUploadEngine {
   private rootPlans: RootPlan[] = []
   /** 根目录 rel → actualRoot 的映射（重命名后子路径前缀同步） */
   private remaps: Array<{ from: string; to: string }> = []
+  /** 批次钉定的基准目录（首次目录操作应答捕获，整批固定防 shell cd 漂移） */
+  private baseDir = ''
   rootPaths: string[] = []
 
   constructor(opts: {
@@ -459,11 +469,13 @@ export class DirUploadEngine {
     return rel
   }
 
-  /** 每轮批量执行前的准备：逐根目录 probe →（冲突时询问）→ 记录映射 */
+  /** 每轮批量执行前的准备：逐根目录 probe →（冲突时询问）→ 记录映射。
+   *  首次目录操作捕获服务端解析的 base，整批钉定（防 shell cd 导致文件漂移） */
   private async prepare(): Promise<void> {
     for (const root of this.roots) {
       try {
-        const probe = await dirSetup(this.alias, this.session, root, { probe: true })
+        const probe = await dirSetup(this.alias, this.session, root, this.baseDir, { probe: true })
+        if (this.baseDir === '' && probe.base) this.baseDir = probe.base
         if (!probe.existed) {
           this.rootPlans.push({ root, actualRoot: root, overwrite: false, path: probe.path })
           continue
@@ -473,7 +485,8 @@ export class DirUploadEngine {
         if (choice === 'overwrite') {
           this.rootPlans.push({ root, actualRoot: root, overwrite: true, path: probe.path })
         } else {
-          const created = await dirSetup(this.alias, this.session, root, { autoRename: true })
+          const created = await dirSetup(this.alias, this.session, root, this.baseDir, { autoRename: true })
+          if (this.baseDir === '' && created.base) this.baseDir = created.base
           this.rootPlans.push({ root, actualRoot: created.actualRel, overwrite: false, path: created.path })
           this.remaps.push({ from: root, to: created.actualRel })
         }
@@ -516,7 +529,7 @@ export class DirUploadEngine {
             : () => {}
         if (isMkdirTask(item.target)) {
           const dir = this.remap(item.target.mkdir)
-          res = await dirSetup(this.alias, this.session, dir, {})
+          res = await dirSetup(this.alias, this.session, dir, this.baseDir, {})
             .then(() => 'ok' as const)
             .catch(() => 'fail' as const)
         } else {
@@ -532,6 +545,7 @@ export class DirUploadEngine {
             name,
             this.overwriteFor(rel),
             resume,
+            this.baseDir,
             onSent,
           )
         }

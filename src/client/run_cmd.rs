@@ -299,7 +299,7 @@ async fn run_pty_session(
                                     let size = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
                                     let res = match tokio::fs::File::open(f).await {
                                         Ok(mut file) => {
-                                            ws_upload(&upload_url, &upload_token, &name, size, &mut file, &upload_session, "", false, upload_cert.as_deref())
+                                            ws_upload(&upload_url, &upload_token, &name, size, &mut file, &upload_session, "", false, "", upload_cert.as_deref())
                                                 .await
                                         }
                                         Err(e) => Err(anyhow!("本地文件打开失败: {e}")),
@@ -701,8 +701,9 @@ async fn upload_dir_tree(
 ) -> Option<String> {
     let root_rel = tree.root_name.clone();
 
-    // 1. 探测根目录是否已存在
-    let probe = match ws_dir_setup(server_url, token, session, &root_rel, true, false, cert).await {
+    // 1. 探测根目录是否已存在（首个请求不携带 base_dir，由服务端解析 cwd；
+    //    应答的 base 在整批后续请求中钉定——shell 上传期间 cd 不再导致文件漂移）
+    let probe = match ws_dir_setup(server_url, token, session, &root_rel, true, false, "", cert).await {
         Ok(p) => p,
         Err(e) => {
             crate::dlog!("[upload] 目录 {root_rel} 探测失败: {e:#}");
@@ -710,15 +711,15 @@ async fn upload_dir_tree(
         }
     };
     // 2. 冲突处理：Windows 弹窗询问覆盖/重命名；其它平台默认重命名
-    let (rel, overwrite, dir_path) = if probe.existed {
+    let (rel, overwrite, dir_path, base_dir) = if probe.existed {
         match ask_overwrite_dialog(&root_rel) {
             Some(true) => {
                 // 覆盖合并：沿用原目录，同名文件覆盖写
-                (root_rel.clone(), true, probe.path.clone())
+                (root_rel.clone(), true, probe.path.clone(), probe.base.clone())
             }
             choice => {
                 // 重命名：自动改名为 root_N 新建目录（内部无冲突）
-                let created = match ws_dir_setup(server_url, token, session, &root_rel, false, true, cert).await {
+                let created = match ws_dir_setup(server_url, token, session, &root_rel, false, true, &probe.base, cert).await {
                     Ok(c) => c,
                     Err(e) => {
                         crate::dlog!("[upload] 目录 {root_rel} 重命名创建失败: {e:#}");
@@ -726,23 +727,23 @@ async fn upload_dir_tree(
                     }
                 };
                 crate::dlog!("[upload] 目录冲突（选择 {}），重命名为 {}", if choice == Some(false) { "重命名" } else { "默认重命名" }, created.actual_rel);
-                (created.actual_rel.clone(), false, created.path.clone())
+                (created.actual_rel.clone(), false, created.path.clone(), created.base.clone())
             }
         }
     } else {
-        (root_rel.clone(), false, probe.path.clone())
+        (root_rel.clone(), false, probe.path.clone(), probe.base.clone())
     };
 
-    // 3. mkdir 还原空目录（根目录改名时同步映射前缀）
+    // 3. mkdir 还原空目录（根目录改名时同步映射前缀；base_dir 钉定）
     for d in &tree.empty_dirs {
         let d = remap_root(d, &tree.root_name, &rel);
-        if let Err(e) = ws_dir_setup(server_url, token, session, &d, false, false, cert).await {
+        if let Err(e) = ws_dir_setup(server_url, token, session, &d, false, false, &base_dir, cert).await {
             crate::dlog!("[upload] 空目录 {d} 还原失败: {e:#}");
         }
     }
 
-    // 4. 逐文件上传（rel 同步映射；覆盖语义随用户选择）。
-    // 注意：rel_path 只含目录部分（不含文件名）——服务端落地 = cwd/rel_path/name，
+    // 4. 逐文件上传（rel 同步映射；覆盖语义随用户选择；base_dir 钉定）。
+    // 注意：rel_path 只含目录部分（不含文件名）——服务端落地 = base_dir/rel_path/name，
     // 完整 rel 会多拼一层同名目录
     let mut ok = 0usize;
     let mut fail = 0usize;
@@ -759,7 +760,7 @@ async fn upload_dir_tree(
         let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         let res = match tokio::fs::File::open(path).await {
             Ok(mut file) => {
-                ws_upload(server_url, token, &name, size, &mut file, session, fdir, overwrite, cert).await
+                ws_upload(server_url, token, &name, size, &mut file, session, fdir, overwrite, &base_dir, cert).await
             }
             Err(e) => Err(anyhow!("本地文件打开失败: {e}")),
         };
