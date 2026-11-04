@@ -285,6 +285,48 @@ pub async fn ws_upload_socket(
     Ok(ws.split())
 }
 
+/// 在会话落地目录下创建空目录（mkdir 语义，协议见服务端 upload.rs）。
+/// rel_path 为 POSIX 分隔的相对路径（服务端逐段净化防穿越；含拖入目录的根名）
+pub async fn ws_mkdir(
+    server_url: &str,
+    token: &str,
+    session: &str,
+    rel_path: &str,
+    cert_sha256: Option<&str>,
+) -> Result<()> {
+    if rel_path.is_empty() {
+        anyhow::bail!("目录路径为空");
+    }
+    let (mut sink, mut stream) = ws_upload_socket(server_url, token, cert_sha256).await?;
+    let init = serde_json::json!({
+        "type": "upload", "name": "", "session": session, "rel_path": rel_path, "mkdir": true
+    });
+    sink.send(WsMessage::Text(init.to_string().into())).await?;
+    loop {
+        match stream.next().await {
+            Some(Ok(WsMessage::Text(t))) => {
+                let v: Value = serde_json::from_str(&t)?;
+                match v["type"].as_str() {
+                    Some("mkdir_ok") => {
+                        let _ = sink.close().await;
+                        return Ok(());
+                    }
+                    Some("ready") => {}
+                    Some("rejected") => {
+                        anyhow::bail!("{}", v["reason"].as_str().unwrap_or("目录创建被拒绝"));
+                    }
+                    _ => {
+                        crate::dlog!("[upload] 目录创建收到未预期的文本帧: {t}");
+                    }
+                }
+            }
+            Some(Ok(_)) => {}
+            Some(Err(e)) => anyhow::bail!("目录创建连接错误: {e}"),
+            None => anyhow::bail!("目录创建连接被服务端关闭"),
+        }
+    }
+}
+
 /// 上传单个文件到服务端：独立 WS 连接（复用 exec 的 TLS pin 校验与 X-Client-Token 认证）。
 /// 协议：init 文本帧（name/size/session）→ Binary 数据帧×N（64KB 分块）→ upload_end 文本帧
 /// → 服务端应答 uploaded（含远端绝对路径）/ rejected 文本帧。
@@ -297,6 +339,7 @@ pub async fn ws_upload(
     size: u64,
     file: &mut tokio::fs::File,
     session_id: &str,
+    rel_path: &str,
     cert_sha256: Option<&str>,
 ) -> Result<String> {
     use tokio::io::AsyncReadExt as _;
@@ -328,8 +371,9 @@ pub async fn ws_upload(
     };
     let (mut sink, mut stream) = ws.split();
 
-    // session_id：服务端据此定位发起上传的 exec 会话 shell 进程 cwd（落地工作目录）
-    let init = serde_json::json!({ "type": "upload", "name": name, "size": size, "session": session_id });
+    // session_id：服务端据此定位发起上传的 exec 会话 shell 进程 cwd（落地工作目录）；
+    // rel_path：目录上传的相对路径（POSIX 分隔，服务端逐段净化），单文件上传为空
+    let init = serde_json::json!({ "type": "upload", "name": name, "size": size, "session": session_id, "rel_path": rel_path });
     sink.send(WsMessage::Text(init.to_string().into())).await?;
 
     let mut buf = vec![0u8; 64 * 1024];

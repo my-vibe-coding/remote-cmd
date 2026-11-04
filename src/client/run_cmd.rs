@@ -1,6 +1,6 @@
 use std::io::{IsTerminal, Read as _, Write as _};
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use futures::{SinkExt, StreamExt};
 use serde_json::json;
 use tokio::sync::mpsc;
@@ -8,8 +8,8 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use super::config::{load_aliases, render_template, ClientConfig, ServerReg};
 use super::remote::{
-    parse_frame, register, resize_msg, trace_frame, ws_exec, ws_upload, ExecFrame, ExecWs,
-    STDIN_CLOSE,
+    parse_frame, register, resize_msg, trace_frame, ws_exec, ws_mkdir, ws_upload, ExecFrame,
+    ExecWs, STDIN_CLOSE,
 };
 use crate::common::fingerprint::MachineInfo;
 
@@ -285,36 +285,56 @@ async fn run_pty_session(
                             }
                         },
                         InputAction::Upload { files, raw } => {
-                            // 逐文件上传（独立 WS 连接）；全部成功 → 把远端路径注入远端 shell
-                            //（等价于用户在提示符处输入文件参数），任一失败 → 回退原文透传。
+                            // 逐目标上传（文件 / 目录混拖支持，独立 WS 连接）：全部成功 →
+                            // 把远端路径注入远端 shell（等价于用户输入路径参数），
+                            // 任一目标整体失败 → 回退原文透传。
                             let mut remote = Vec::with_capacity(files.len());
                             let mut failed = false;
                             for f in &files {
-                                let name = f
-                                    .file_name()
-                                    .map(|s| s.to_string_lossy().into_owned())
-                                    .unwrap_or_default();
-                                let size = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
-                                let res = match tokio::fs::File::open(f).await {
-                                    Ok(mut file) => {
-                                        ws_upload(&upload_url, &upload_token, &name, size, &mut file, &upload_session, upload_cert.as_deref())
-                                            .await
+                                if f.is_file() {
+                                    let name = f
+                                        .file_name()
+                                        .map(|s| s.to_string_lossy().into_owned())
+                                        .unwrap_or_default();
+                                    let size = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
+                                    let res = match tokio::fs::File::open(f).await {
+                                        Ok(mut file) => {
+                                            ws_upload(&upload_url, &upload_token, &name, size, &mut file, &upload_session, "", upload_cert.as_deref())
+                                                .await
+                                        }
+                                        Err(e) => Err(anyhow!("本地文件打开失败: {e}")),
+                                    };
+                                    match res {
+                                        Ok(p) => remote.push(p),
+                                        Err(e) => {
+                                            crate::dlog!("[upload] {name} 上传失败: {e:#}");
+                                            failed = true;
+                                        }
                                     }
-                                    Err(e) => Err(anyhow!("本地文件打开失败: {e}")),
-                                };
-                                match res {
-                                    Ok(p) => remote.push(p),
-                                    Err(e) => {
-                                        crate::dlog!("[upload] {name} 上传失败: {e:#}");
-                                        failed = true;
-                                        break;
+                                } else {
+                                    // 目录：本地收集树（限深，匹配服务端 rel_path ≤16 段）→
+                                    // mkdir 还原空目录 → 逐文件带 rel_path 上传
+                                    match collect_dir_tree(f) {
+                                        Ok(tree) => {
+                                            match upload_dir_tree(&upload_url, &upload_token, &upload_session, upload_cert.as_deref(), &tree).await {
+                                                Some(p) => remote.push(p),
+                                                None => {
+                                                    crate::dlog!("[upload] 目录 {} 上传失败（无成功文件）", f.display());
+                                                    failed = true;
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            crate::dlog!("[upload] 目录 {} 收集失败: {e:#}", f.display());
+                                            failed = true;
+                                        }
                                     }
                                 }
                             }
                             let text = if failed || remote.is_empty() {
                                 String::from_utf8_lossy(&raw).into_owned()
                             } else {
-                                crate::dlog!("[upload] 已上传 {} 个文件: {}", remote.len(), remote.join(" "));
+                                crate::dlog!("[upload] 已上传 {} 个目标: {}", remote.len(), remote.join(" "));
                                 remote.iter().map(|p| quote_for_shell(p)).collect::<Vec<_>>().join(" ")
                             };
                             let filtered = reply_filter.feed(text.as_bytes());
@@ -458,10 +478,10 @@ fn collect_burst(first: Vec<u8>) -> Option<Vec<u8>> {
     }
 }
 
-/// 判定突发输入是否为"全部存在的本地文件路径"（拖放/粘贴上传触发条件）：
+/// 判定突发输入是否为"全部存在的本地路径"（拖放/粘贴上传触发条件，文件与目录均可）：
 /// 优先按引号语义解析（资源管理器拖放/规范粘贴，空格分隔、含空格路径 "" 包裹），
-/// 全部 token 均为存在的普通文件 → 触发上传；
-/// 否则若整串不含引号，视为**单个**无引号路径（含空格），整串查文件存在性；
+/// 全部 token 均存在 → 触发上传（文件走单文件上传，目录走目录树上传）；
+/// 否则若整串不含引号，视为**单个**无引号路径（含空格），整串查存在性；
 /// 都不满足 → 返回 None，原始字节按普通输入透传给远端。
 fn upload_paths(burst: &[u8]) -> Option<Vec<std::path::PathBuf>> {
     let text = std::str::from_utf8(burst).ok()?;
@@ -474,15 +494,15 @@ fn upload_paths(burst: &[u8]) -> Option<Vec<std::path::PathBuf>> {
     let paths = parse_paths(text);
     if !paths.is_empty() {
         let files: Vec<std::path::PathBuf> = paths.into_iter().map(std::path::PathBuf::from).collect();
-        if files.iter().all(|p| p.is_file()) {
+        if files.iter().all(|p| p.exists()) {
             return Some(files);
         }
     }
 
-    // 无引号含空格：只可能是单个路径，整串当文件名查（存在即为单路径，否则透传）
+    // 无引号含空格：只可能是单个路径，整串当路径查（存在即为单路径，否则透传）
     if !text.contains('"') {
         let p = std::path::PathBuf::from(text);
-        if p.is_file() {
+        if p.exists() {
             return Some(vec![p]);
         }
     }
@@ -548,6 +568,145 @@ fn parse_paths(s: &str) -> Vec<String> {
 /// 防止不可信文件名在远端 shell 触发命令替换），内部单引号以 `'\''` 转义
 fn quote_for_shell(p: &str) -> String {
     format!("'{}'", p.replace('\'', "'\\''"))
+}
+
+// ---------- CLI 目录上传（拖放目录到终端） ----------
+
+/// 目录树收集结果：文件 (本地路径, rel) 与空目录 rel（rel 含拖入目录根名，POSIX 分隔）
+struct DirTree {
+    root_name: String,
+    files: Vec<(std::path::PathBuf, String)>,
+    empty_dirs: Vec<String>,
+    /// 因非法名称/超深被跳过的条目数
+    skipped: usize,
+}
+
+/// 路径组件校验（与服务端净化语义对齐）：非法组件的条目跳过而非整树拒绝，
+/// 避免一个坏名字导致整个目录上传失败
+fn sanitize_component(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && !name.contains(['\\', '/'])
+        && !name.chars().any(|c| c.is_control())
+        && name.chars().count() <= 255
+}
+
+/// 根名之外的最大层级（服务端 rel_path 限 16 段，含根名）
+const DIR_WALK_DEPTH_MAX: usize = 15;
+
+/// 递归收集目录树；空目录（无任何子项）记入 empty_dirs 供 mkdir 还原
+fn walk_dir_tree(dir: &std::path::Path, rel: &str, tree: &mut DirTree) -> anyhow::Result<()> {
+    if rel.split('/').count() > DIR_WALK_DEPTH_MAX {
+        tree.skipped += 1;
+        return Ok(());
+    }
+    let entries = std::fs::read_dir(dir).with_context(|| format!("读取目录失败: {}", dir.display()))?;
+    let mut children = 0usize;
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => {
+                tree.skipped += 1;
+                continue;
+            }
+        };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !sanitize_component(&name) {
+            tree.skipped += 1;
+            continue;
+        }
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => {
+                tree.skipped += 1;
+                continue;
+            }
+        };
+        let child_rel = format!("{rel}/{name}");
+        if meta.is_dir() {
+            children += 1;
+            walk_dir_tree(&entry.path(), &child_rel, tree)?;
+        } else if meta.is_file() {
+            children += 1;
+            tree.files.push((entry.path(), child_rel));
+        } else {
+            tree.skipped += 1; // 符号链接等非常规条目
+        }
+    }
+    if children == 0 {
+        tree.empty_dirs.push(rel.to_string());
+    }
+    Ok(())
+}
+
+/// 递归收集拖入目录的树（rel 以拖入目录的根名为第一层）
+fn collect_dir_tree(root: &std::path::Path) -> anyhow::Result<DirTree> {
+    let root_name = root
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if !sanitize_component(&root_name) {
+        anyhow::bail!("目录名含非法字符: {root_name:?}");
+    }
+    let mut tree = DirTree {
+        root_name: root_name.clone(),
+        files: Vec::new(),
+        empty_dirs: Vec::new(),
+        skipped: 0,
+    };
+    walk_dir_tree(root, &root_name, &mut tree)?;
+    Ok(tree)
+}
+
+/// 目录上传执行：mkdir 还原空目录 → 逐文件带 rel_path 上传。
+/// 返回远端目录路径（任一文件成功时，取落地文件的父目录——_N 重命名只影响文件名）
+async fn upload_dir_tree(
+    server_url: &str,
+    token: &str,
+    session: &str,
+    cert: Option<&str>,
+    tree: &DirTree,
+) -> Option<String> {
+    for d in &tree.empty_dirs {
+        if let Err(e) = ws_mkdir(server_url, token, session, d, cert).await {
+            crate::dlog!("[upload] 空目录 {d} 还原失败: {e:#}");
+        }
+    }
+    let mut first_dir: Option<String> = None;
+    let mut ok = 0usize;
+    let mut fail = 0usize;
+    for (path, rel) in &tree.files {
+        let name = path
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let res = match tokio::fs::File::open(path).await {
+            Ok(mut file) => ws_upload(server_url, token, &name, size, &mut file, session, rel, cert).await,
+            Err(e) => Err(anyhow!("本地文件打开失败: {e}")),
+        };
+        match res {
+            Ok(p) => {
+                ok += 1;
+                if first_dir.is_none() {
+                    first_dir = std::path::Path::new(&p)
+                        .parent()
+                        .map(|d| d.to_string_lossy().into_owned());
+                }
+            }
+            Err(e) => {
+                crate::dlog!("[upload] {rel} 上传失败: {e:#}");
+                fail += 1;
+            }
+        }
+    }
+    crate::dlog!(
+        "[upload] 目录 {} 上传完成: 成功 {ok} 失败 {fail} 跳过 {}",
+        tree.root_name,
+        tree.skipped
+    );
+    first_dir
 }
 
 /// raw mode 兜底恢复：正常返回路径经 Drop 关闭；process::exit 路径需在此之前手动关闭。
@@ -1004,7 +1163,7 @@ mod tests {
         assert_eq!(parse_paths("\"  lead\""), vec!["  lead"]);
     }
 
-    /// 上传判定：全部 token 存在且为普通文件才触发；目录/不存在的路径按普通输入透传
+    /// 上传判定：全部 token 存在（文件或目录）才触发；不存在的路径按普通输入透传
     #[test]
     fn upload_paths_requires_all_regular_files() {
         let dir = std::env::temp_dir().join(format!("rc-upload-paths-{}", std::process::id()));
@@ -1017,8 +1176,11 @@ mod tests {
             upload_paths(a.to_string_lossy().as_bytes()).map(|v| v.len()),
             Some(1)
         );
-        // 目录 → 不触发
-        assert!(upload_paths(dir.to_string_lossy().as_bytes()).is_none());
+        // 目录 → 触发（目录上传）
+        assert_eq!(
+            upload_paths(dir.to_string_lossy().as_bytes()).map(|v| v.len()),
+            Some(1)
+        );
         // 不存在的路径 → 不触发
         assert!(upload_paths(b"definitely-not-exist-xyz").is_none());
         // 普通命令文本 → 不触发
@@ -1040,6 +1202,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 目录树收集：层级还原（rel 含根名）、空目录识别、非法组件跳过
+    #[test]
+    fn collect_dir_tree_walks_and_flags_empty_dirs() {
+        let root = std::env::temp_dir().join(format!("rc-dirtree-{}", std::process::id()));
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(root.join("empty")).unwrap();
+        std::fs::write(sub.join("a.txt"), "x").unwrap();
+        std::fs::write(root.join("b.txt"), "y").unwrap();
+
+        let tree = collect_dir_tree(&root).unwrap();
+        assert_eq!(tree.root_name, format!("rc-dirtree-{}", std::process::id()));
+        let rels: Vec<&str> = tree.files.iter().map(|(_, r)| r.as_str()).collect();
+        let root_name = tree.root_name.clone();
+        assert!(rels.contains(&format!("{root_name}/sub/a.txt").as_str()), "rels = {rels:?}");
+        assert!(rels.contains(&format!("{root_name}/b.txt").as_str()), "rels = {rels:?}");
+        assert_eq!(tree.empty_dirs, vec![format!("{root_name}/empty")]);
+        assert_eq!(tree.skipped, 0);
+
+        // 非法组件校验（Windows 文件系统本身不允许控制字符名，此处直接验证组件规则）
+        assert!(!sanitize_component(".."));
+        assert!(!sanitize_component(".."));
+        assert!(!sanitize_component("a/b"));
+        assert!(sanitize_component("ok.txt"));
+        // 根名非法 → 整体拒绝
+        assert!(collect_dir_tree(std::path::Path::new(".")).is_err()); // 根名 "." 非法
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// upload_paths 端到端：无引号空格路径整串当单文件查
     #[test]
     fn upload_paths_supports_unquoted_spaced_paths() {
@@ -1056,11 +1248,13 @@ mod tests {
         // 命令 + 存在路径 → 整串不是文件，不触发（原文透传）
         let cmd = format!("cat {}", spaced.display());
         assert!(upload_paths(cmd.as_bytes()).is_none());
-        // 两个无引号路径 → 整串不是文件，不触发（含空格多路径只支持引号包裹形式）
+        // 两个无引号路径（均不含空格；含空格多路径只支持引号包裹形式）→ 逐目标上传
         let plain = dir.join("p1.txt");
         std::fs::write(&plain, "x").unwrap();
-        let two = format!("{} {}", spaced.display(), plain.display());
-        assert!(upload_paths(two.as_bytes()).is_none());
+        let plain2 = dir.join("p2.txt");
+        std::fs::write(&plain2, "x").unwrap();
+        let two = format!("{} {}", plain.display(), plain2.display());
+        assert_eq!(upload_paths(two.as_bytes()).map(|v| v.len()), Some(2));
         // 引号包裹 → 引号语义直接命中
         let quoted = format!("\"{}\"", spaced.display());
         assert_eq!(upload_paths(quoted.as_bytes()).map(|v| v.len()), Some(1));
