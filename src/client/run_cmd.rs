@@ -289,63 +289,24 @@ async fn run_pty_session(
                             // 逐目标上传（文件 / 目录混拖支持，独立 WS 连接）：全部成功 →
                             // 把远端路径注入远端 shell（等价于用户输入路径参数），
                             // 任一目标整体失败 → 回退原文透传。
-                            let mut remote = Vec::with_capacity(files.len());
+                            // 预扫描：文件 stat 取大小、目录收集树（含 total_bytes），
+                            // 合计全局总量供统一进度弹窗使用；收集失败的目标按原逻辑标记
                             let mut failed = false;
+                            let mut scanned: Vec<(bool, &std::path::PathBuf, u64, Option<DirTree>)> = Vec::new();
+                            let mut total_bytes = 0u64;
+                            let mut total_files = 0usize;
                             for f in &files {
                                 if f.is_file() {
-                                    let name = f
-                                        .file_name()
-                                        .map(|s| s.to_string_lossy().into_owned())
-                                        .unwrap_or_default();
                                     let size = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
-                                    // 单文件上传进度弹窗：独立子进程宿主（主线程被 tokio 占用，
-                                    // 无法本进程弹窗）；spawn 失败退化为无弹窗上传，Drop 关闭
-                                    let prog = UploadProgress::spawn(
-                                        "remote-cmd 上传",
-                                        &format!("正在上传 {name}"),
-                                        "准备上传…",
-                                    );
-                                    let res = match tokio::fs::File::open(f).await {
-                                        Ok(mut file) => {
-                                            let on_prog = |done: u64, total: u64| {
-                                                let text = format!(
-                                                    "上传 {name} {}/{}",
-                                                    crate::client::dialog::fmt_bytes(done),
-                                                    crate::client::dialog::fmt_bytes(total)
-                                                );
-                                                match total {
-                                                    t if t > 0 => prog.set(done as f64 / t as f64, &text),
-                                                    _ => prog.indeterminate(&format!("上传 {name} {}", fmt_bytes(done))),
-                                                }
-                                            };
-                                            ws_upload(&upload_url, &upload_token, &name, size, &mut file, &upload_session, "", false, "", upload_cert.as_deref(), Some(&on_prog))
-                                                .await
-                                        }
-                                        Err(e) => Err(anyhow!("本地文件打开失败: {e}")),
-                                    };
-                                    match res {
-                                        Ok(p) => {
-                                            prog.set(1.0, "上传完成");
-                                            remote.push(p);
-                                        }
-                                        Err(e) => {
-                                            crate::dlog!("[upload] {name} 上传失败: {e:#}");
-                                            failed = true;
-                                        }
-                                    }
-                                    drop(prog);
+                                    total_bytes += size;
+                                    total_files += 1;
+                                    scanned.push((true, f, size, None));
                                 } else {
-                                    // 目录：本地收集树（限深，匹配服务端 rel_path ≤16 段）→
-                                    // mkdir 还原空目录 → 逐文件带 rel_path 上传
                                     match collect_dir_tree(f) {
                                         Ok(tree) => {
-                                            match upload_dir_tree(&upload_url, &upload_token, &upload_session, upload_cert.as_deref(), &tree).await {
-                                                Some(p) => remote.push(p),
-                                                None => {
-                                                    crate::dlog!("[upload] 目录 {} 上传失败（无成功文件）", f.display());
-                                                    failed = true;
-                                                }
-                                            }
+                                            total_bytes += tree.total_bytes;
+                                            total_files += tree.files.len();
+                                            scanned.push((false, f, 0, Some(tree)));
                                         }
                                         Err(e) => {
                                             crate::dlog!("[upload] 目录 {} 收集失败: {e:#}", f.display());
@@ -354,6 +315,63 @@ async fn run_pty_session(
                                     }
                                 }
                             }
+                            // 统一进度弹窗：一次拖放共用一个（无显示环境退化为 no-op）
+                            let batch = if total_files > 0 {
+                                Some(BatchProgress::new(total_bytes, total_files))
+                            } else {
+                                None
+                            };
+                            let mut remote = Vec::with_capacity(files.len());
+                            for (is_file, f, size, tree) in scanned {
+                                if is_file {
+                                    let name = f
+                                        .file_name()
+                                        .map(|s| s.to_string_lossy().into_owned())
+                                        .unwrap_or_default();
+                                    if let Some(b) = &batch {
+                                        b.report(&name, 0, size); // 起始汇报
+                                    }
+                                    let file_cb = |sent: u64, _t: u64| {
+                                        if let Some(b) = &batch {
+                                            b.report(&name, sent, size)
+                                        }
+                                    };
+                                    let cb: Option<&(dyn Fn(u64, u64) + Send + Sync)> =
+                                        if batch.is_some() { Some(&file_cb) } else { None };
+                                    let res = match tokio::fs::File::open(f).await {
+                                        Ok(mut file) => {
+                                            ws_upload(&upload_url, &upload_token, &name, size, &mut file, &upload_session, "", false, "", upload_cert.as_deref(), cb)
+                                                .await
+                                        }
+                                        Err(e) => Err(anyhow!("本地文件打开失败: {e}")),
+                                    };
+                                    if let Some(b) = &batch {
+                                        b.finish_one(size);
+                                    }
+                                    match res {
+                                        Ok(p) => remote.push(p),
+                                        Err(e) => {
+                                            crate::dlog!("[upload] {name} 上传失败: {e:#}");
+                                            failed = true;
+                                        }
+                                    }
+                                } else if let Some(tree) = tree {
+                                    // 目录：mkdir 还原空目录 → 逐文件带 rel_path 上传
+                                    match upload_dir_tree(&upload_url, &upload_token, &upload_session, upload_cert.as_deref(), &tree, batch.as_ref()).await {
+                                        Some(p) => remote.push(p),
+                                        None => {
+                                            crate::dlog!("[upload] 目录 {} 上传失败（无成功文件）", f.display());
+                                            failed = true;
+                                        }
+                                    }
+                                }
+                            }
+                            if let Some(b) = &batch {
+                                if !failed && !remote.is_empty() {
+                                    b.complete();
+                                }
+                            }
+                            drop(batch);
                             let text = if failed || remote.is_empty() {
                                 String::from_utf8_lossy(&raw).into_owned()
                             } else {
@@ -602,6 +620,8 @@ struct DirTree {
     empty_dirs: Vec<String>,
     /// 因非法名称/超深被跳过的条目数
     skipped: usize,
+    /// 全部文件字节总量（统一进度弹窗的全局进度用）
+    total_bytes: u64,
 }
 
 /// 路径组件校验（与服务端净化语义对齐）：非法组件的条目跳过而非整树拒绝，
@@ -652,6 +672,7 @@ fn walk_dir_tree(dir: &std::path::Path, rel: &str, tree: &mut DirTree) -> anyhow
             walk_dir_tree(&entry.path(), &child_rel, tree)?;
         } else if meta.is_file() {
             children += 1;
+            tree.total_bytes += meta.len();
             tree.files.push((entry.path(), child_rel));
         } else {
             tree.skipped += 1; // 符号链接等非常规条目
@@ -677,6 +698,7 @@ fn collect_dir_tree(root: &std::path::Path) -> anyhow::Result<DirTree> {
         files: Vec::new(),
         empty_dirs: Vec::new(),
         skipped: 0,
+        total_bytes: 0,
     };
     walk_dir_tree(root, &root_name, &mut tree)?;
     Ok(tree)
@@ -712,6 +734,61 @@ fn ask_overwrite_dialog(_rel_root: &str) -> Option<bool> {
     None
 }
 
+/// 批次上传的全局进度状态：一次拖放的所有目标（文件 + 目录内的文件）共用一个
+/// 弹窗，进度按全局字节总量计算，文案展示文件计数与当前文件名。
+/// 原子计数保证跨 await 的闭包捕获无锁且 Sync（tokio::spawn 要求）
+struct BatchProgress {
+    prog: UploadProgress,
+    /// 预扫描的全局字节总量
+    total_bytes: u64,
+    /// 预扫描的全局文件数
+    total_files: usize,
+    /// 已完结文件的累计字节
+    done: std::sync::atomic::AtomicU64,
+    /// 已完结文件数
+    files_done: std::sync::atomic::AtomicUsize,
+}
+
+impl BatchProgress {
+    fn new(total_bytes: u64, total_files: usize) -> Self {
+        let main = format!("正在上传 {total_files} 个文件");
+        Self {
+            prog: UploadProgress::spawn("remote-cmd 上传", &main, "准备上传…"),
+            total_bytes,
+            total_files,
+            done: std::sync::atomic::AtomicU64::new(0),
+            files_done: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// 进度汇报：done = 已完结字节 + 当前文件内已发送字节。
+    /// sent/size 为当前文件的（file_start 与 ws_upload 逐块回调共用此入口）
+    fn report(&self, name: &str, sent: u64, size: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let done = self.done.load(Relaxed) + sent.min(size);
+        let k = self.files_done.load(Relaxed) + 1; // 当前是第 k 个文件
+        let text = format!(
+            "{} / {}（第 {k}/{} 个 · {name}）",
+            fmt_bytes(done),
+            fmt_bytes(self.total_bytes),
+            self.total_files
+        );
+        let frac = if self.total_bytes > 0 { done as f64 / self.total_bytes as f64 } else { 0.0 };
+        self.prog.set(frac, &text);
+    }
+
+    /// 一个文件完结（成功或失败都计，失败的字节按已处理算，保证进度可走完）
+    fn finish_one(&self, size: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.done.fetch_add(size, Relaxed);
+        self.files_done.fetch_add(1, Relaxed);
+    }
+
+    fn complete(&self) {
+        self.prog.set(1.0, "上传完成");
+    }
+}
+
 /// 目录上传执行：探测根目录 →（已存在时 Windows 弹窗选择覆盖/重命名，其它平台默认
 /// 重命名）→ mkdir 还原空目录 → 逐文件上传（覆盖语义随用户选择）。
 /// 返回远端目录绝对路径（服务端确认值，非从文件路径推导）
@@ -721,6 +798,7 @@ async fn upload_dir_tree(
     session: &str,
     cert: Option<&str>,
     tree: &DirTree,
+    batch: Option<&BatchProgress>,
 ) -> Option<String> {
     let root_rel = tree.root_name.clone();
 
@@ -781,12 +859,29 @@ async fn upload_dir_tree(
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
         let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        if let Some(b) = batch {
+            b.report(&name, 0, size); // 起始汇报（空文件也有完整文案）
+        }
+        // 批次进度闭包：把当前文件的块级进度折算为全局进度（batch 为 None 时为空操作）
+        let file_cb = |sent: u64, _t: u64| {
+            if let Some(b) = batch {
+                b.report(&name, sent, size)
+            }
+        };
+        let cb: Option<&(dyn Fn(u64, u64) + Send + Sync)> = if batch.is_some() {
+            Some(&file_cb)
+        } else {
+            None
+        };
         let res = match tokio::fs::File::open(path).await {
             Ok(mut file) => {
-                ws_upload(server_url, token, &name, size, &mut file, session, fdir, overwrite, &base_dir, cert, None).await
+                ws_upload(server_url, token, &name, size, &mut file, session, fdir, overwrite, &base_dir, cert, cb).await
             }
             Err(e) => Err(anyhow!("本地文件打开失败: {e}")),
         };
+        if let Some(b) = batch {
+            b.finish_one(size);
+        }
         match res {
             Ok(_) => ok += 1,
             Err(e) => {
