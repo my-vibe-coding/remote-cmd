@@ -6,8 +6,7 @@ mod server;
 
 use clap::Parser;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     // 联调诊断：panic 全量落盘（PTY 场景 stderr 不可见；进程无声死亡时用于区分 panic 与外部击杀）
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -30,7 +29,45 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // 别名 shim 模式：bin 目录下以别名命名的 exe 副本（脚本生成功能创建），
-    // 必须在 clap 解析之前拦截，避免别名参数被误认为选项
+    // 必须在 clap 解析之前拦截，避免别名参数被误认为选项；run 为 async，
+    // 同步 main 中先判定再转入 tokio 主流程
+    let shimmed = client::script::shim_alias().is_some();
+
+    let cli = if shimmed { None } else { Some(cli::Cli::parse()) };
+
+    // 自更新命令：xdialog 的事件循环必须占用主线程（其 Builder 文档约束），需在
+    // tokio 接管前调度——更新逻辑运行在 xdialog 拉起的线程上；无显示环境（无头
+    // Linux）时弹窗自动退化为 no-op，静默更新不受影响。--check 仅查版本，无弹窗
+    if let Some(cli) = &cli {
+        if let Some(cli::Command::Update { check: false }) = &cli.command {
+            let code = xdialog::XDialogBuilder::new().run_i32(update_entry);
+            std::process::exit(code);
+        }
+    }
+
+    tokio_main(cli)
+}
+
+/// update 命令入口：运行在 xdialog 拉起的逻辑线程上（主线程已被其事件循环占用），
+/// 以 current-thread 运行时执行更新，退出码经 run_i32 返回给进程
+fn update_entry() -> i32 {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("创建 tokio 运行时失败");
+    match rt.block_on(common::self_update::update()) {
+        Ok(()) => 0,
+        Err(e) => {
+            macro_log::e!("更新失败: {e:#}");
+            1
+        }
+    }
+}
+
+/// 常规命令分发：pre_parsed 为 None 时处于 shim 模式（须先于 clap 处理），
+/// 否则为 main 中已解析好的 cli
+#[tokio::main]
+async fn tokio_main(pre_parsed: Option<cli::Cli>) -> anyhow::Result<()> {
     if let Some(alias) = client::script::shim_alias() {
         let args: Vec<String> = std::env::args().skip(1).collect();
         let res = client::run_cmd::run(&alias, &args, false).await;
@@ -40,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
         return res;
     }
 
-    let cli = cli::Cli::parse();
+    let cli = pre_parsed.unwrap_or_else(cli::Cli::parse);
     match cli.command {
         Some(cli::Command::Serve {
             port,

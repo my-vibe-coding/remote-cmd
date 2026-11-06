@@ -19,6 +19,11 @@ use std::process::Command;
 
 use anyhow::{anyhow, bail, Context, Result};
 
+use crate::client::dialog::{fmt_bytes, UpdateProgress};
+
+/// 进度弹窗刷新节流间隔（避免逐 chunk 调用拖慢下载）
+const PROG_REFRESH: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// GitHub Releases 最新版查询接口（未认证限流 60 次/小时/IP，手动触发足够）
 const REPO_API: &str = "https://api.github.com/repos/my-vibe-coding/remote-cmd/releases/latest";
 
@@ -83,12 +88,13 @@ fn system_proxy() -> Option<String> {
             _ => {}
         }
     }
-    // ProxyEnable => 是否启用手动设置代理
-    // AutoConfigURL => 是否使用自动配置脚本
+    // ProxyEnable => 是否启用手动设置代理（全局模式）
+    // AutoConfigURL => 是否使用自动配置脚本（PAC模式）
     if !enabled && auto_config.is_none() {
         return None;
     }
-    let server = server?;
+    // 全局模式通常没有 AutoConfigURL，仅依赖 ProxyServer
+    let server = auto_config.unwrap_or_else(|| server.unwrap());
     // ProxyServer 形如 "host:port"（所有协议共用）或 "http=...;https=...;ftp=..."（分协议）
     let https = server
         .split(';')
@@ -223,7 +229,27 @@ pub async fn check() -> Result<()> {
 
 // ---------- 下载与校验 ----------
 
-async fn download(client: &reqwest::Client, url: &str, dest: &PathBuf) -> Result<()> {
+/// 进度汇报：总量已知（Content-Length）时用百分比进度条，未知时用不确定模式
+fn report_prog(p: &UpdateProgress, label: &str, done: u64, total: Option<u64>) {
+    let text = format!(
+        "{label} {}/{}",
+        fmt_bytes(done),
+        total.map(fmt_bytes).unwrap_or_else(|| "?".into())
+    );
+    match total {
+        Some(t) if t > 0 => p.set(done as f64 / t as f64, &text),
+        _ => p.indeterminate(&format!("{label} {}", fmt_bytes(done))),
+    }
+}
+
+/// 下载 url 到 dest；prog 非空时汇报进度（按 PROG_REFRESH 节流，收尾强制刷一次）
+async fn download(
+    client: &reqwest::Client,
+    url: &str,
+    dest: &PathBuf,
+    prog: Option<&UpdateProgress>,
+    label: &str,
+) -> Result<()> {
     let mut resp = client
         .get(url)
         .send()
@@ -231,9 +257,22 @@ async fn download(client: &reqwest::Client, url: &str, dest: &PathBuf) -> Result
         .context("下载失败")?
         .error_for_status()
         .context("下载返回错误状态")?;
+    let total = resp.content_length();
     let mut f = File::create(dest)?;
+    let mut done: u64 = 0;
+    let mut last = std::time::Instant::now();
     while let Some(chunk) = resp.chunk().await? {
         f.write_all(&chunk)?;
+        done += chunk.len() as u64;
+        if let Some(p) = prog {
+            if last.elapsed() >= PROG_REFRESH {
+                last = std::time::Instant::now();
+                report_prog(p, label, done, total);
+            }
+        }
+    }
+    if let Some(p) = prog {
+        report_prog(p, label, done, total);
     }
     f.flush()?;
     Ok(())
@@ -371,12 +410,19 @@ pub async fn update() -> Result<()> {
     let zip_path = dir.join(format!("{}.download", rel.asset_name));
     let sums_path = dir.join("SHA256SUMS.download");
 
+    // 进度弹窗：无显示环境时退化为 no-op（无头服务器照常静默更新），Drop 时关闭
+    let prog = UpdateProgress::new(
+        &format!("正在更新 remote-cmd 到 v{}", rel.tag),
+        "准备下载更新包…",
+    );
+
     // 下载 + 完整性校验
-    download(&client, &asset_url, &zip_path).await?;
+    download(&client, &asset_url, &zip_path, Some(&prog), "下载更新包").await?;
+    prog.indeterminate("校验文件完整性（SHA256）…");
     let actual = sha256_file(&zip_path)?;
     match &rel.sums_url {
         Some(u) => {
-            download(&client, u, &sums_path).await?;
+            download(&client, u, &sums_path, None, "").await?;
             let sums = fs::read_to_string(&sums_path)?;
             match expected_hash(&sums, &rel.asset_name) {
                 Some(h) if h.eq_ignore_ascii_case(&actual) => {}
@@ -388,6 +434,7 @@ pub async fn update() -> Result<()> {
     }
 
     // 解压 + 替换
+    prog.indeterminate("解压新版本…");
     let exe = std::env::current_exe().context("获取自身路径失败")?;
     #[cfg(windows)]
     let new_bin = dir.join("remote-cmd.new.exe");
@@ -395,6 +442,7 @@ pub async fn update() -> Result<()> {
     let new_bin = dir.join("remote-cmd.new");
     extract_binary(&zip_path, &new_bin)?;
 
+    prog.indeterminate("替换程序文件…");
     #[cfg(windows)]
     {
         // Windows：运行中的 exe 不能覆盖但可以改名——两次 rename 完成换位
@@ -412,6 +460,7 @@ pub async fn update() -> Result<()> {
     }
 
     // shim 是主程序的完整副本，同步重新生成（current_exe 此时已指向新二进制内容）
+    prog.indeterminate("更新收尾…");
     if let Err(e) = crate::client::script::gen_scripts(None) {
         macro_log::w!("重新生成 shim 失败（可手动执行 gen-script）: {e:#}");
     }
@@ -419,6 +468,9 @@ pub async fn update() -> Result<()> {
     // 清理下载残留
     let _ = fs::remove_file(&zip_path);
     let _ = fs::remove_file(&sums_path);
+
+    // 展示完成态后随函数返回关闭弹窗（Drop；失败路径 bail! 时同样关闭）
+    prog.set(1.0, &format!("已更新到 v{CURRENT_VERSION} → v{}，即将退出", rel.tag));
 
     macro_log::i!("已更新到 v{}，重新运行生效", rel.tag);
     Ok(())

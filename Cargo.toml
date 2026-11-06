@@ -34,6 +34,7 @@ portable-pty = "0.9"
 crossterm = "0.29"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 tower-http = { version = "0.6", features = ["trace"] }
+xdialog = "4.1.4"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Globalization", "Win32_Foundation", "Win32_System_Com", "Win32_System_Console", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging"] }
