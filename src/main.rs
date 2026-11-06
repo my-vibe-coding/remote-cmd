@@ -28,6 +28,17 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // 上传进度弹窗宿主：由上传方 spawn（--progress-dialog），主线程跑 xdialog 事件
+    // 循环，stdin 行式 JSON 驱动进度（见 dialog::run_progress_host）；stdin EOF
+    // （上传方退出/崩溃）时自动关闭，无窗口残留
+    if args.iter().any(|a| a == "--progress-dialog") {
+        let code = xdialog::XDialogBuilder::new().run_i32(|| {
+            client::dialog::run_progress_host();
+            0
+        });
+        std::process::exit(code);
+    }
+
     // 别名 shim 模式：bin 目录下以别名命名的 exe 副本（脚本生成功能创建），
     // 必须在 clap 解析之前拦截，避免别名参数被误认为选项；run 为 async，
     // 同步 main 中先判定再转入 tokio 主流程

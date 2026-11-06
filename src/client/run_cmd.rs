@@ -12,6 +12,7 @@ use super::remote::{
     ExecWs, STDIN_CLOSE,
 };
 use crate::common::fingerprint::MachineInfo;
+use crate::client::dialog::{fmt_bytes, UploadProgress};
 
 /// WS 心跳间隔：空闲会话周期发 Ping，防 NAT/代理静默掐断长连接
 const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -297,20 +298,42 @@ async fn run_pty_session(
                                         .map(|s| s.to_string_lossy().into_owned())
                                         .unwrap_or_default();
                                     let size = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
+                                    // 单文件上传进度弹窗：独立子进程宿主（主线程被 tokio 占用，
+                                    // 无法本进程弹窗）；spawn 失败退化为无弹窗上传，Drop 关闭
+                                    let prog = UploadProgress::spawn(
+                                        "remote-cmd 上传",
+                                        &format!("正在上传 {name}"),
+                                        "准备上传…",
+                                    );
                                     let res = match tokio::fs::File::open(f).await {
                                         Ok(mut file) => {
-                                            ws_upload(&upload_url, &upload_token, &name, size, &mut file, &upload_session, "", false, "", upload_cert.as_deref())
+                                            let on_prog = |done: u64, total: u64| {
+                                                let text = format!(
+                                                    "上传 {name} {}/{}",
+                                                    crate::client::dialog::fmt_bytes(done),
+                                                    crate::client::dialog::fmt_bytes(total)
+                                                );
+                                                match total {
+                                                    t if t > 0 => prog.set(done as f64 / t as f64, &text),
+                                                    _ => prog.indeterminate(&format!("上传 {name} {}", fmt_bytes(done))),
+                                                }
+                                            };
+                                            ws_upload(&upload_url, &upload_token, &name, size, &mut file, &upload_session, "", false, "", upload_cert.as_deref(), Some(&on_prog))
                                                 .await
                                         }
                                         Err(e) => Err(anyhow!("本地文件打开失败: {e}")),
                                     };
                                     match res {
-                                        Ok(p) => remote.push(p),
+                                        Ok(p) => {
+                                            prog.set(1.0, "上传完成");
+                                            remote.push(p);
+                                        }
                                         Err(e) => {
                                             crate::dlog!("[upload] {name} 上传失败: {e:#}");
                                             failed = true;
                                         }
                                     }
+                                    drop(prog);
                                 } else {
                                     // 目录：本地收集树（限深，匹配服务端 rel_path ≤16 段）→
                                     // mkdir 还原空目录 → 逐文件带 rel_path 上传
@@ -760,7 +783,7 @@ async fn upload_dir_tree(
         let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         let res = match tokio::fs::File::open(path).await {
             Ok(mut file) => {
-                ws_upload(server_url, token, &name, size, &mut file, session, fdir, overwrite, &base_dir, cert).await
+                ws_upload(server_url, token, &name, size, &mut file, session, fdir, overwrite, &base_dir, cert, None).await
             }
             Err(e) => Err(anyhow!("本地文件打开失败: {e}")),
         };

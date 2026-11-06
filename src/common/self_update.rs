@@ -412,6 +412,7 @@ pub async fn update() -> Result<()> {
 
     // 进度弹窗：无显示环境时退化为 no-op（无头服务器照常静默更新），Drop 时关闭
     let prog = UpdateProgress::new(
+        "remote-cmd 更新",
         &format!("正在更新 remote-cmd 到 v{}", rel.tag),
         "准备下载更新包…",
     );

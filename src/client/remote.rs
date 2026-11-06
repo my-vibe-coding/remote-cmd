@@ -383,6 +383,7 @@ pub async fn ws_upload(
     overwrite: bool,
     base_dir: &str,
     cert_sha256: Option<&str>,
+    on_progress: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
 ) -> Result<String> {
     use tokio::io::AsyncReadExt as _;
 
@@ -421,12 +422,18 @@ pub async fn ws_upload(
     sink.send(WsMessage::Text(init.to_string().into())).await?;
 
     let mut buf = vec![0u8; 64 * 1024];
+    let mut sent: u64 = 0;
     loop {
         let n = file.read(&mut buf).await?;
         if n == 0 {
             break;
         }
         sink.send(WsMessage::Binary(buf[..n].to_vec().into())).await?;
+        sent += n as u64;
+        // 进度语义为"已发送"（WS 无应用层 ACK，非服务端确认落盘）；节流由回调方处理
+        if let Some(cb) = on_progress {
+            cb(sent, size);
+        }
     }
     sink.send(WsMessage::Text(serde_json::json!({ "type": "upload_end" }).to_string().into()))
         .await?;
