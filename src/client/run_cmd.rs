@@ -12,7 +12,7 @@ use super::remote::{
     ExecWs, STDIN_CLOSE,
 };
 use crate::common::fingerprint::MachineInfo;
-use crate::client::dialog::{fmt_bytes, UploadProgress};
+use crate::client::dialog::{ask_overwrite_dialog, fmt_bytes, OverwriteChoice, UploadProgress};
 
 /// WS 心跳间隔：空闲会话周期发 Ping，防 NAT/代理静默掐断长连接
 const PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -704,41 +704,14 @@ fn collect_dir_tree(root: &std::path::Path) -> anyhow::Result<DirTree> {
     Ok(tree)
 }
 
-/// Windows 冲突询问弹窗：Some(true)=覆盖、Some(false)=重命名。其它平台无原生对话框
-/// 机制 → None（调用方使用默认值"重命名"）。基于既有 windows-sys 依赖的 MessageBoxW，
-/// 不引入新的对话框 crate
-#[cfg(windows)]
-fn ask_overwrite_dialog(rel_root: &str) -> Option<bool> {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        MessageBoxW, IDYES, MB_ICONQUESTION, MB_SETFOREGROUND, MB_YESNO,
-    };
-    let text = format!(
-        "服务器上已存在目录「{rel_root}」。\n\n是 = 覆盖合并（同名文件覆盖，其余保留）\n否 = 重命名为新目录（原目录不动）"
-    );
-    let text_w: Vec<u16> = text.encode_utf16().chain([0]).collect();
-    let title_w: Vec<u16> = "目录上传".encode_utf16().chain([0]).collect();
-    let r = unsafe {
-        MessageBoxW(
-            std::ptr::null_mut(),
-            text_w.as_ptr(),
-            title_w.as_ptr(),
-            MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND,
-        )
-    };
-    Some(r == IDYES)
-}
-
-/// 非 Windows：无统一原生对话框，默认重命名
-#[cfg(not(windows))]
-fn ask_overwrite_dialog(_rel_root: &str) -> Option<bool> {
-    None
-}
-
 /// 批次上传的全局进度状态：一次拖放的所有目标（文件 + 目录内的文件）共用一个
 /// 弹窗，进度按全局字节总量计算，文案展示文件计数与当前文件名。
-/// 原子计数保证跨 await 的闭包捕获无锁且 Sync（tokio::spawn 要求）
+/// 原子计数保证跨 await 的闭包捕获无锁且 Sync（tokio::spawn 要求）。
+///
+/// 弹窗懒生成（首次 report 才 spawn）：目录冲突询问框弹出的时机早于任何文件上传，
+/// 若此刻进度窗已存在，置顶的进度窗会遮住询问框
 struct BatchProgress {
-    prog: UploadProgress,
+    prog: std::sync::OnceLock<UploadProgress>,
     /// 预扫描的全局字节总量
     total_bytes: u64,
     /// 预扫描的全局文件数
@@ -751,14 +724,24 @@ struct BatchProgress {
 
 impl BatchProgress {
     fn new(total_bytes: u64, total_files: usize) -> Self {
-        let main = format!("正在上传 {total_files} 个文件");
         Self {
-            prog: UploadProgress::spawn("remote-cmd 上传", &main, "准备上传…"),
+            prog: std::sync::OnceLock::new(),
             total_bytes,
             total_files,
             done: std::sync::atomic::AtomicU64::new(0),
             files_done: std::sync::atomic::AtomicUsize::new(0),
         }
+    }
+
+    /// 弹窗句柄：首次调用时 spawn 宿主子进程（失败退化为 no-op 句柄）
+    fn prog(&self) -> &UploadProgress {
+        self.prog.get_or_init(|| {
+            UploadProgress::spawn(
+                "remote-cmd 上传",
+                &format!("正在上传 {} 个文件", self.total_files),
+                "准备上传…",
+            )
+        })
     }
 
     /// 进度汇报：done = 已完结字节 + 当前文件内已发送字节。
@@ -774,7 +757,7 @@ impl BatchProgress {
             self.total_files
         );
         let frac = if self.total_bytes > 0 { done as f64 / self.total_bytes as f64 } else { 0.0 };
-        self.prog.set(frac, &text);
+        self.prog().set(frac, &text);
     }
 
     /// 一个文件完结（成功或失败都计，失败的字节按已处理算，保证进度可走完）
@@ -785,7 +768,7 @@ impl BatchProgress {
     }
 
     fn complete(&self) {
-        self.prog.set(1.0, "上传完成");
+        self.prog().set(1.0, "上传完成");
     }
 }
 
@@ -811,14 +794,19 @@ async fn upload_dir_tree(
             return None;
         }
     };
-    // 2. 冲突处理：Windows 弹窗询问覆盖/重命名；其它平台默认重命名
+    // 2. 冲突处理：Windows 弹窗询问覆盖/重命名/取消；其它平台默认重命名
     let (rel, overwrite, dir_path, base_dir) = if probe.existed {
         match ask_overwrite_dialog(&root_rel) {
-            Some(true) => {
+            OverwriteChoice::Overwrite => {
                 // 覆盖合并：沿用原目录，同名文件覆盖写
                 (root_rel.clone(), true, probe.path.clone(), probe.base.clone())
             }
-            choice => {
+            OverwriteChoice::Cancel => {
+                // 放弃本次上传：返回 None → 调用方标记失败，回退原文透传
+                crate::dlog!("[upload] 目录 {root_rel} 冲突，用户取消上传");
+                return None;
+            }
+            OverwriteChoice::Rename => {
                 // 重命名：自动改名为 root_N 新建目录（内部无冲突）
                 let created = match ws_dir_setup(server_url, token, session, &root_rel, false, true, &probe.base, cert).await {
                     Ok(c) => c,
@@ -827,7 +815,7 @@ async fn upload_dir_tree(
                         return None;
                     }
                 };
-                crate::dlog!("[upload] 目录冲突（选择 {}），重命名为 {}", if choice == Some(false) { "重命名" } else { "默认重命名" }, created.actual_rel);
+                crate::dlog!("[upload] 目录冲突，重命名为 {}", created.actual_rel);
                 (created.actual_rel.clone(), false, created.path.clone(), created.base.clone())
             }
         }

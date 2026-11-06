@@ -191,3 +191,54 @@ pub fn run_progress_host() {
         }
     }
 }
+
+// ---------- 同步询问弹窗 ----------
+
+/// 目录冲突询问的三个选择：覆盖合并 / 重命名 / 放弃上传
+pub enum OverwriteChoice {
+    Overwrite,
+    Rename,
+    Cancel,
+}
+
+/// 目录冲突询问弹窗（是/否/取消三按钮）。其它平台无统一原生对话框机制 →
+/// Rename（调用方默认值）。
+///
+/// 保留 MessageBoxW 而非 xdialog：xdialog 的事件循环须占用主线程（Builder 约束），
+/// 而客户端进程的主线程已被 tokio 运行时占用、无法初始化其事件循环；这里是同步
+/// 阻塞式询问，MessageBoxW 恰好满足（与 BatchProgress 的子进程方案不同，询问需要
+/// 立即拿到应答，无法经 stdin 协议异步驱动）
+#[cfg(windows)]
+pub fn ask_overwrite_dialog(rel_root: &str) -> OverwriteChoice {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, IDNO, IDYES, MB_ICONQUESTION, MB_SETFOREGROUND, MB_TOPMOST, MB_YESNOCANCEL,
+    };
+    let text = format!(
+        "服务器上已存在目录「{rel_root}」。\n\n是 = 覆盖合并（同名文件覆盖，其余保留）\n否 = 重命名为新目录（原目录不动）\n取消 = 放弃本次上传"
+    );
+    let text_w: Vec<u16> = text.encode_utf16().chain([0]).collect();
+    let title_w: Vec<u16> = "目录上传".encode_utf16().chain([0]).collect();
+    let r = unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            text_w.as_ptr(),
+            title_w.as_ptr(),
+            // TOPMOST：进度弹窗（xdialog 置顶窗）可能已存在，仅 SETFOREGROUND 抢不到最顶层
+            MB_YESNOCANCEL | MB_ICONQUESTION | MB_SETFOREGROUND | MB_TOPMOST,
+        )
+    };
+    // 关闭按钮（X）同样返回 IDCANCEL，视为放弃
+    if r == IDYES {
+        OverwriteChoice::Overwrite
+    } else if r == IDNO {
+        OverwriteChoice::Rename
+    } else {
+        OverwriteChoice::Cancel
+    }
+}
+
+/// 非 Windows：无统一原生对话框，默认重命名
+#[cfg(not(windows))]
+pub fn ask_overwrite_dialog(_rel_root: &str) -> OverwriteChoice {
+    OverwriteChoice::Rename
+}
